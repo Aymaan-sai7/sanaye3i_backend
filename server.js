@@ -20,9 +20,20 @@ const DB_FILE = process.env.RAILWAY_VOLUME_MOUNT_PATH
   : './db.json';
 
 if (!fs.existsSync(DB_FILE)) {
-  const initialData = { users: [], workers: [], bookings: [], reviews: [], messages: [], conversations: [] };
+  const initialData = { users: [], workers: [], bookings: [], reviews: [], messages: [], conversations: [], notifications: [] };
   fs.writeFileSync(DB_FILE, JSON.stringify(initialData, null, 2));
 }
+
+// ⚠️ لو الـ Volume عندك متعمل من قبل وفيه بيانات، لازم نضيف مصفوفة notifications
+// فاضية لو مش موجودة أصلاً في db.json القديم (وإلا أي كتابة عليها هترمي error)
+function ensureNotificationsCollection() {
+  const db = readDB();
+  if (!db.notifications) {
+    db.notifications = [];
+    writeDB(db);
+  }
+}
+ensureNotificationsCollection();
 
 function readDB() { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
 function writeDB(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
@@ -168,15 +179,40 @@ function verifyToken(req, res, next) {
 // ============ باقي الـ collections ============
 // ⚠️ لاحظ إننا شلنا 'users' من هنا خالص عشان محدش يقدر يعمل GET /users
 // ويشوف كل المستخدمين بالباسورد الحقيقي بتاعهم
-const collections = ['workers', 'bookings', 'reviews', 'messages', 'conversations'];
+const collections = ['workers', 'bookings', 'reviews', 'messages', 'conversations', 'notifications'];
+
+// query params بتبدأ بـ _ دي أوامر خاصة (ترتيب/تحديد عدد) زي json-server،
+// مش فلاتر بيانات فعلية — لازم نستثنيهم من الفلترة العادية
+const SPECIAL_QUERY_KEYS = ['_sort', '_order', '_limit', '_page'];
 
 collections.forEach((collection) => {
   app.get(`/${collection}`, (req, res) => {
     const db = readDB();
     let items = db[collection] || [];
-    Object.keys(req.query).forEach((key) => {
-      items = items.filter((item) => String(item[key]) === String(req.query[key]));
+    const query = req.query;
+
+    // فلترة عادية (equality) — بتتجاهل الـ special keys
+    Object.keys(query).forEach((key) => {
+      if (SPECIAL_QUERY_KEYS.includes(key)) return;
+      items = items.filter((item) => String(item[key]) === String(query[key]));
     });
+
+    // ترتيب (زي json-server: ?_sort=createdAt&_order=desc)
+    if (query._sort) {
+      const order = query._order === 'desc' ? -1 : 1;
+      items = [...items].sort((a, b) => {
+        const field = query._sort;
+        if (a[field] < b[field]) return -1 * order;
+        if (a[field] > b[field]) return 1 * order;
+        return 0;
+      });
+    }
+
+    // تحديد عدد النتائج (زي json-server: ?_limit=20)
+    if (query._limit) {
+      items = items.slice(0, Number(query._limit));
+    }
+
     res.json(items);
   });
 });
@@ -223,7 +259,7 @@ collections.forEach((collection) => {
   });
 });
 
-app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
+app.get('/', (req, res) => res.send('Sanaye3i Backend is Running '));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));
