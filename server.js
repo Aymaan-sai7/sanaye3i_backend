@@ -261,27 +261,5 @@ collections.forEach((collection) => {
 
 app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
 
-// ⚠️⚠️ endpoint مؤقت بس — بيمسح كل البيانات ويرجعها فاضية.
-// بيتنادى مرة واحدة بس من المتصفح، وبعدين لازم نشيله من الكود فورًا.
-// محمي بمفتاح سري من الـ environment variables عشان محدش تاني يقدر ينادي عليه.
-app.get('/admin/reset-db', (req, res) => {
-  const secret = req.query.key;
-  if (secret !== process.env.RESET_SECRET) {
-    return res.status(403).json({ message: 'مش مصرح.' });
-  }
-
-  const freshData = {
-    users: [],
-    workers: [],
-    bookings: [],
-    reviews: [],
-    messages: [],
-    conversations: [],
-    notifications: [],
-  };
-  writeDB(freshData);
-  res.json({ message: 'تم مسح كل البيانات بنجاح.', path: DB_FILE });
-});
-
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));
