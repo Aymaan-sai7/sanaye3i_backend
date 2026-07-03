@@ -142,14 +142,17 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
     const db = readDB();
     const user = db.users.find((u) => u.email === email);
 
-    // نفس رسالة الخطأ للاتنين (إيميل مش موجود / باسورد غلط) عشان منديش معلومة لمهاجم إن الإيميل موجود أو لأ
+    // ⚠️ ملاحظة أمان: فصلنا رسالة "الإيميل مش موجود" عن "الباسورد غلط" بناءً على
+    // طلب صريح لتحسين تجربة الاستخدام. ده بيسهّل على أي حد يعرف الإيميلات
+    // المسجلة فعليًا (user enumeration)، بس مقبول لمشروع تخرج مش بيتعامل مع
+    // بيانات حساسة. لو حبيت ترجعها موحدة تاني، رجّع الرسالتين لنفس النص.
     if (!user) {
-      return res.status(401).json({ message: 'البريد الإلكتروني أو كلمة المرور غلط.' });
+      return res.status(401).json({ message: 'الحساب ده مش موجود، سجل حساب جديد الأول.' });
     }
 
     const match = await bcrypt.compare(password, user.password);
     if (!match) {
-      return res.status(401).json({ message: 'البريد الإلكتروني أو كلمة المرور غلط.' });
+      return res.status(401).json({ message: 'كلمة المرور غلط.' });
     }
 
     const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
