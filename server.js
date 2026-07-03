@@ -43,14 +43,31 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-app.post('/auth/register', async (req, res) => {
+// حد أعلى وأخف على التسجيل — يمنع إنشاء حسابات سبام بالجملة من نفس الـ IP
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // ساعة
+  max: 10,
+  message: { message: 'محاولات تسجيل كتير، حاول تاني بعد شوية.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// ── التسجيل: عملية واحدة atomic — user + worker profile (لو pro) بيتكتبوا مع بعض ──
+app.post('/auth/register', registerLimiter, async (req, res) => {
   try {
-    const { email, password, fullName, role } = req.body;
+    const { email, password, fullName, role, workerData } = req.body;
+
     if (!email || !password || !fullName || !role) {
       return res.status(400).json({ message: 'بيانات ناقصة.' });
     }
     if (password.length < 8) {
       return res.status(400).json({ message: 'الباسورد لازم يكون 8 حروف على الأقل.' });
+    }
+    if (role !== 'client' && role !== 'pro') {
+      return res.status(400).json({ message: 'نوع الحساب غير صالح.' });
+    }
+    if (role === 'pro' && !workerData) {
+      return res.status(400).json({ message: 'بيانات الصنايعي ناقصة.' });
     }
 
     const db = readDB();
@@ -69,11 +86,36 @@ app.post('/auth/register', async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
+    // لو pro، بنجهز بيانات الـ worker الأول قبل أي كتابة فعلية على الملف
+    let newWorker = null;
+    if (role === 'pro') {
+      newWorker = {
+        id: crypto.randomUUID(),
+        userId: newUser.id,
+        fullName: workerData.fullName ?? fullName,
+        trade: workerData.trade,
+        tradeLabel: workerData.tradeLabel,
+        city: workerData.city,
+        hourlyRate: Number(workerData.hourlyRate) || 0,
+        yearsOfExperience: Number(workerData.yearsOfExperience) || 0,
+        serviceRadius: Number(workerData.serviceRadius) || 15,
+        rating: 0,
+        reviewsCount: 0,
+        isAvailable: true,
+        completedJobs: 0,
+        bio: workerData.bio ?? '',
+        avatarColor: workerData.avatarColor ?? '#2563EB',
+      };
+    }
+
+    // الكتابة الفعلية بتحصل مرة واحدة بس، بعد ما كل حاجة جاهزة —
+    // يعني إما الاتنين يتسجلوا مع بعض، أو محدش يتسجل خالص
     db.users.push(newUser);
+    if (newWorker) db.workers.push(newWorker);
     writeDB(db);
 
     const token = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, { expiresIn: '7d' });
-    res.status(201).json({ user: sanitizeUser(newUser), token });
+    res.status(201).json({ user: sanitizeUser(newUser), token, worker: newWorker });
   } catch (err) {
     res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
   }
@@ -106,7 +148,24 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
   }
 });
 
-// ============ باقي الـ collections (زي ما هي) ============
+// ── Middleware للتحقق من JWT — هنستخدمه في endpoint رفع الملفات ──
+function verifyToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'غير مصرح.' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.id;
+    req.userRole = decoded.role;
+    next();
+  } catch {
+    return res.status(401).json({ message: 'الجلسة منتهية، سجل دخول تاني.' });
+  }
+}
+
+// ============ باقي الـ collections ============
 // ⚠️ لاحظ إننا شلنا 'users' من هنا خالص عشان محدش يقدر يعمل GET /users
 // ويشوف كل المستخدمين بالباسورد الحقيقي بتاعهم
 const collections = ['workers', 'bookings', 'reviews', 'messages', 'conversations'];
