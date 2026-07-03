@@ -1,54 +1,127 @@
+const crypto = require('crypto');
 const express = require('express');
 const fs = require('fs');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 const app = express();
-app.use(cors());
+
+// ⚠️ غيّر ده لدومين الفرونت إند بتاعك الحقيقي وقت الديبلوي
+const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:4200';
+app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
 
-// لو فيه Volume متوصل، استخدم مساره. لو لأ (تطوير محلي)، استخدم الملف اللي جنب الكود
+// ⚠️ لازم تضيفه كـ environment variable في Railway (Variables tab)، متسيبوش هنا في production
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+
 const DB_FILE = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/db.json`
   : './db.json';
 
-// أول تشغيل: لو الملف مش موجود (Volume فاضي)، اعمله بـ collections فاضية
 if (!fs.existsSync(DB_FILE)) {
-  const initialData = {
-    users: [],
-    workers: [],
-    bookings: [],
-    reviews: [],
-    messages: [],
-    conversations: []
-  };
+  const initialData = { users: [], workers: [], bookings: [], reviews: [], messages: [], conversations: [] };
   fs.writeFileSync(DB_FILE, JSON.stringify(initialData, null, 2));
-  console.log('db.json created with empty collections at', DB_FILE);
 }
 
-function readDB() {
-  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-}
-function writeDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+function readDB() { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+function writeDB(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
+
+// بيشيل الباسورد قبل ما نرجع أي user object للفرونت إند
+function sanitizeUser(user) {
+  const { password, ...safe } = user;
+  return safe;
 }
 
-const collections = ['users', 'workers', 'bookings', 'reviews', 'messages', 'conversations'];
+// ============ AUTH ENDPOINTS ============
 
-// GET All + فلترة بـ query params (زي json-server)
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 دقيقة
+  max: 5,
+  message: { message: 'محاولات كتير غلط، حاول تاني بعد شوية.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.post('/auth/register', async (req, res) => {
+  try {
+    const { email, password, fullName, role } = req.body;
+    if (!email || !password || !fullName || !role) {
+      return res.status(400).json({ message: 'بيانات ناقصة.' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ message: 'الباسورد لازم يكون 8 حروف على الأقل.' });
+    }
+
+    const db = readDB();
+    const exists = db.users.find((u) => u.email === email);
+    if (exists) {
+      return res.status(409).json({ message: 'البريد الإلكتروني ده مسجل بالفعل.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = {
+      id: crypto.randomUUID(),
+      email,
+      password: hashedPassword,
+      fullName,
+      role,
+      createdAt: new Date().toISOString(),
+    };
+
+    db.users.push(newUser);
+    writeDB(db);
+
+    const token = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, { expiresIn: '7d' });
+    res.status(201).json({ user: sanitizeUser(newUser), token });
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+app.post('/auth/login', loginLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ message: 'بيانات ناقصة.' });
+    }
+
+    const db = readDB();
+    const user = db.users.find((u) => u.email === email);
+
+    // نفس رسالة الخطأ للاتنين (إيميل مش موجود / باسورد غلط) عشان منديش معلومة لمهاجم إن الإيميل موجود أو لأ
+    if (!user) {
+      return res.status(401).json({ message: 'البريد الإلكتروني أو كلمة المرور غلط.' });
+    }
+
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      return res.status(401).json({ message: 'البريد الإلكتروني أو كلمة المرور غلط.' });
+    }
+
+    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ user: sanitizeUser(user), token });
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+// ============ باقي الـ collections (زي ما هي) ============
+// ⚠️ لاحظ إننا شلنا 'users' من هنا خالص عشان محدش يقدر يعمل GET /users
+// ويشوف كل المستخدمين بالباسورد الحقيقي بتاعهم
+const collections = ['workers', 'bookings', 'reviews', 'messages', 'conversations'];
+
 collections.forEach((collection) => {
   app.get(`/${collection}`, (req, res) => {
     const db = readDB();
     let items = db[collection] || [];
-    const query = req.query;
-
-    Object.keys(query).forEach((key) => {
-      items = items.filter((item) => String(item[key]) === String(query[key]));
+    Object.keys(req.query).forEach((key) => {
+      items = items.filter((item) => String(item[key]) === String(req.query[key]));
     });
-
     res.json(items);
   });
 });
 
-// GET By Id
 collections.forEach((collection) => {
   app.get(`/${collection}/:id`, (req, res) => {
     const db = readDB();
@@ -58,22 +131,17 @@ collections.forEach((collection) => {
   });
 });
 
-// POST
 collections.forEach((collection) => {
   app.post(`/${collection}`, (req, res) => {
     const db = readDB();
     if (!db[collection]) db[collection] = [];
-    const newItem = {
-      id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
-      ...req.body,
-    };
+    const newItem = { id: Date.now().toString() + Math.random().toString(36).slice(2, 6), ...req.body };
     db[collection].push(newItem);
     writeDB(db);
     res.status(201).json(newItem);
   });
 });
 
-// PUT + PATCH (نفس اللوجيك — تحديث جزئي)
 collections.forEach((collection) => {
   const updateHandler = (req, res) => {
     const db = readDB();
@@ -87,7 +155,6 @@ collections.forEach((collection) => {
   app.patch(`/${collection}/:id`, updateHandler);
 });
 
-// DELETE
 collections.forEach((collection) => {
   app.delete(`/${collection}/:id`, (req, res) => {
     const db = readDB();
@@ -97,7 +164,7 @@ collections.forEach((collection) => {
   });
 });
 
-app.get('/', (req, res) => res.send('Sanaye3i Backend is Running '));
+app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));

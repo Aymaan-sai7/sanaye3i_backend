@@ -349,7 +349,7 @@
       "serviceRadius": 12,
       "rating": 4,
       "reviewsCount": 1,
-      "isAvailable": false,
+      "isAvailable": true,
       "completedJobs": 1,
       "bio": "شغالللل",
       "avatarColor": "#2563EB",
@@ -454,8 +454,8 @@
     {
       "clientId": "Mz8dHMhMRjs",
       "workerId": "BgUVicgieIg",
-      "lastMessage": "تماممم",
-      "lastMessageAt": "2026-07-02T11:16:53.538Z",
+      "lastMessage": "قولي",
+      "lastMessageAt": "2026-07-02T22:11:39.032Z",
       "id": "js06JjZ-02I"
     },
     {
@@ -468,9 +468,16 @@
     {
       "clientId": "Mz8dHMhMRjs",
       "workerId": "0ab80398-5f66-4dd8-b51e-ae6120a93f01",
-      "lastMessage": "يخاللل",
-      "lastMessageAt": "2026-07-02T11:18:24.061Z",
+      "lastMessage": "يخاللل بقولك",
+      "lastMessageAt": "2026-07-02T22:11:03.071Z",
       "id": "ok5u_tjqJLs"
+    },
+    {
+      "id": "1783030230458cxfz",
+      "clientId": "Mz8dHMhMRjs",
+      "workerId": "u2",
+      "lastMessage": "تمام",
+      "lastMessageAt": "2026-07-02T22:10:42.492Z"
     }
   ],
   "messages": [
@@ -562,7 +569,7 @@
       "senderRole": "client",
       "recipientId": "BgUVicgieIg",
       "text": "تماممم",
-      "isRead": false,
+      "isRead": true,
       "createdAt": "2026-07-02T11:16:53.538Z",
       "id": "bmAttHU-Zyw"
     },
@@ -575,6 +582,66 @@
       "isRead": false,
       "createdAt": "2026-07-02T11:18:24.061Z",
       "id": "3COwGXpmvbU"
+    },
+    {
+      "id": 1783029896515,
+      "conversationId": "js06JjZ-02I",
+      "senderId": "Mz8dHMhMRjs",
+      "senderRole": "client",
+      "recipientId": "u2",
+      "text": "بقولك",
+      "isRead": false,
+      "createdAt": "2026-07-02T22:04:56.511Z"
+    },
+    {
+      "id": 1783029920000,
+      "conversationId": "js06JjZ-02I",
+      "senderId": "Mz8dHMhMRjs",
+      "senderRole": "client",
+      "recipientId": "u2",
+      "text": "بقولك",
+      "isRead": false,
+      "createdAt": "2026-07-02T22:05:19.993Z"
+    },
+    {
+      "id": "17830302366216a9a",
+      "conversationId": "1783030230458cxfz",
+      "senderId": "Mz8dHMhMRjs",
+      "senderRole": "client",
+      "recipientId": "u2",
+      "text": "بقولك",
+      "isRead": false,
+      "createdAt": "2026-07-02T22:10:36.614Z"
+    },
+    {
+      "id": "17830302424983yw9",
+      "conversationId": "1783030230458cxfz",
+      "senderId": "Mz8dHMhMRjs",
+      "senderRole": "client",
+      "recipientId": "u2",
+      "text": "تمام",
+      "isRead": false,
+      "createdAt": "2026-07-02T22:10:42.492Z"
+    },
+    {
+      "id": "17830302630759q8l",
+      "conversationId": "ok5u_tjqJLs",
+      "senderId": "Mz8dHMhMRjs",
+      "senderRole": "client",
+      "recipientId": "0ab80398-5f66-4dd8-b51e-ae6120a93f01",
+      "text": "يخاللل بقولك",
+      "isRead": false,
+      "createdAt": "2026-07-02T22:11:03.071Z"
+    },
+    {
+      "id": "1783030299037cl0k",
+      "conversationId": "js06JjZ-02I",
+      "senderId": "BgUVicgieIg",
+      "senderRole": "pro",
+      "recipientId": "Mz8dHMhMRjs",
+      "text": "قولي",
+      "isRead": true,
+      "createdAt": "2026-07-02T22:11:39.032Z"
     }
   ],
   "$schema": "./node_modules/json-server/schema.json"
