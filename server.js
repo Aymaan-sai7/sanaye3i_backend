@@ -1,10 +1,12 @@
 const crypto = require('crypto');
 const express = require('express');
 const fs = require('fs');
+const path = require('path');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
+const multer = require('multer');
 const app = express();
 
 // ⚠️ غيّر ده لدومين الفرونت إند بتاعك الحقيقي وقت الديبلوي
@@ -37,6 +39,38 @@ ensureNotificationsCollection();
 
 function readDB() { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
 function writeDB(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
+
+// مجلد رفع الملفات — جوه نفس الـ Volume عشان يفضل موجود بعد أي redeploy
+const UPLOADS_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH
+  ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/uploads`
+  : './uploads';
+
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  filename: (req, file, cb) => {
+    const uniqueName = crypto.randomUUID() + path.extname(file.originalname);
+    cb(null, uniqueName);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB لكل ملف
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+    if (!allowed.includes(file.mimetype)) {
+      return cb(new Error('نوع الملف مش مسموح به. استخدم صورة أو PDF.'));
+    }
+    cb(null, true);
+  },
+});
+
+// السماح بالوصول للملفات المرفوعة (عرض الصور)
+app.use('/uploads', express.static(UPLOADS_DIR));
 
 // بيشيل الباسورد قبل ما نرجع أي user object للفرونت إند
 function sanitizeUser(user) {
@@ -178,6 +212,53 @@ function verifyToken(req, res, next) {
     return res.status(401).json({ message: 'الجلسة منتهية، سجل دخول تاني.' });
   }
 }
+
+// ── Endpoint رفع مستندات التحقق (محمي بـ JWT) ────────────
+app.post(
+  '/workers/:workerId/verification-docs',
+  verifyToken,
+  upload.fields([
+    { name: 'idFront', maxCount: 1 },
+    { name: 'idBack', maxCount: 1 },
+    { name: 'certificate', maxCount: 1 },
+  ]),
+  (req, res) => {
+    try {
+      const db = readDB();
+      const worker = db.workers.find((w) => w.id === req.params.workerId);
+      if (!worker) return res.status(404).json({ message: 'مش لاقي بيانات الصنايعي.' });
+
+      // تأكيد إن اللي بيرفع هو نفسه صاحب البروفايل
+      if (worker.userId !== req.userId) {
+        return res.status(403).json({ message: 'مش مسموحلك بالتعديل ده.' });
+      }
+
+      if (req.files?.['idFront']?.[0]) {
+        worker.idFrontUrl = `/uploads/${req.files['idFront'][0].filename}`;
+      }
+      if (req.files?.['idBack']?.[0]) {
+        worker.idBackUrl = `/uploads/${req.files['idBack'][0].filename}`;
+      }
+      if (req.files?.['certificate']?.[0]) {
+        worker.certificateUrl = `/uploads/${req.files['certificate'][0].filename}`;
+      }
+      worker.verificationStatus = 'pending';
+
+      writeDB(db);
+      res.json(worker);
+    } catch (err) {
+      res.status(500).json({ message: 'حصل خطأ أثناء رفع الملفات.' });
+    }
+  }
+);
+
+// معالج أخطاء multer (نوع ملف غلط / حجم كبير) — لازم يتحط بعد الـ routes
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError || err.message?.includes('نوع الملف')) {
+    return res.status(400).json({ message: err.message || 'خطأ في رفع الملف.' });
+  }
+  next(err);
+});
 
 // ============ باقي الـ collections ============
 // ⚠️ لاحظ إننا شلنا 'users' من هنا خالص عشان محدش يقدر يعمل GET /users
