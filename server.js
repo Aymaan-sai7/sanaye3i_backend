@@ -17,6 +17,9 @@ app.use(express.json());
 // ⚠️ لازم تضيفه كـ environment variable في Railway (Variables tab)، متسيبوش هنا في production
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 
+// ⚠️ سيكريت مؤقت لعمل أول حساب أدمن بس — لو مش موجود كـ env var، endpoint البوتستراب بيتعطل تلقائيًا (بيرجع 404)
+const BOOTSTRAP_SECRET = process.env.ADMIN_BOOTSTRAP_SECRET;
+
 const DB_FILE = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/db.json`
   : './db.json';
@@ -98,9 +101,10 @@ const registerLimiter = rateLimit({
 });
 
 // ── التسجيل: عملية واحدة atomic — user + worker profile (لو pro) بيتكتبوا مع بعض ──
+// ⚠️ كل حساب جديد بيتعمل بـ status: 'pending' ومبيرجعش token — لازم موافقة أدمن الأول
 app.post('/auth/register', registerLimiter, async (req, res) => {
   try {
-    const { email, password, fullName, role, workerData } = req.body;
+    const { email, password, fullName, role, nationalId, workerData } = req.body;
 
     if (!email || !password || !fullName || !role) {
       return res.status(400).json({ message: 'بيانات ناقصة.' });
@@ -114,11 +118,21 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     if (role === 'pro' && !workerData) {
       return res.status(400).json({ message: 'بيانات الصنايعي ناقصة.' });
     }
+    if (!nationalId || !/^\d{14}$/.test(nationalId)) {
+      return res.status(400).json({ message: 'الرقم القومي لازم يكون 14 رقم صحيح.' });
+    }
 
     const db = readDB();
-    const exists = db.users.find((u) => u.email === email);
-    if (exists) {
+
+    const emailExists = db.users.find((u) => u.email === email);
+    if (emailExists) {
       return res.status(409).json({ message: 'البريد الإلكتروني ده مسجل بالفعل.' });
+    }
+
+    // فحص الرقم القومي بغض النظر عن الدور — بيمنع نفس الشخص يسجل كـ client وpro مع بعض
+    const nationalIdExists = db.users.find((u) => u.nationalId === nationalId);
+    if (nationalIdExists) {
+      return res.status(409).json({ message: 'الرقم القومي ده مسجل بحساب تاني بالفعل.' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -128,6 +142,8 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
       password: hashedPassword,
       fullName,
       role,
+      nationalId,
+      status: 'pending',
       createdAt: new Date().toISOString(),
     };
 
@@ -159,8 +175,21 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     if (newWorker) db.workers.push(newWorker);
     writeDB(db);
 
-    const token = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, { expiresIn: '7d' });
-    res.status(201).json({ user: sanitizeUser(newUser), token, worker: newWorker });
+    // ⚠️ مفيش session token هنا خالص — الحساب pending لحد ما الأدمن يوافق عليه.
+    // بس لو pro، بنرجّع docsUploadToken قصير العمر (15 دقيقة) غرضه الوحيد إنه
+    // يسمح للفرونت إند يرفع مستندات التحقق فورًا بعد التسجيل. ده مش session
+    // token — الفرونت إند ميحفظهوش في localStorage/sessionStorage ولا
+    // بيستخدمه كـ "تسجيل دخول"، بيستخدمه مرة واحدة بس في نفس الطلب ده ويرميه
+    const docsUploadToken = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, {
+      expiresIn: '15m',
+    });
+
+    res.status(201).json({
+      message: 'طلبك اتبعت للمراجعة، هنراجعه ونرد عليك في أقرب وقت.',
+      user: sanitizeUser(newUser),
+      worker: newWorker,
+      docsUploadToken,
+    });
   } catch (err) {
     res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
   }
@@ -189,6 +218,19 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
       return res.status(401).json({ message: 'كلمة المرور غلط.' });
     }
 
+    // ⚠️ فحص الـ status بعد نجاح الباسورد — لاحظ إننا بنرفض حالات معينة بس (مش
+    // بنشترط status === 'active')، عشان أي حساب قديم اتعمل قبل إضافة الحقل ده
+    // (status يبقى undefined) يفضل يشتغل عادي من غير ما نحتاج migration script
+    if (user.status === 'pending') {
+      return res.status(403).json({ message: 'حسابك لسه قيد المراجعة من الأدمن، هنبلغك أول ما يتم قبوله.' });
+    }
+    if (user.status === 'blocked') {
+      return res.status(403).json({ message: 'حسابك متحظور. تواصل مع الدعم لو محتاج توضيح.' });
+    }
+    if (user.status === 'rejected') {
+      return res.status(403).json({ message: 'للأسف طلب انضمامك اتقفل. تواصل مع الدعم لو حابب تفاصيل.' });
+    }
+
     const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ user: sanitizeUser(user), token });
   } catch (err) {
@@ -196,7 +238,7 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
   }
 });
 
-// ── Middleware للتحقق من JWT — هنستخدمه في endpoint رفع الملفات ──
+// ── Middleware للتحقق من JWT ──
 function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -211,6 +253,16 @@ function verifyToken(req, res, next) {
   } catch {
     return res.status(401).json({ message: 'الجلسة منتهية، سجل دخول تاني.' });
   }
+}
+
+// ── Middleware إضافي فوق verifyToken — بيتأكد إن الدور admin بالظبط ──
+function verifyAdmin(req, res, next) {
+  verifyToken(req, res, () => {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ message: 'غير مصرح لك بالوصول لده.' });
+    }
+    next();
+  });
 }
 
 // ── Endpoint رفع مستندات التحقق (محمي بـ JWT) ────────────
@@ -258,6 +310,107 @@ app.use((err, req, res, next) => {
     return res.status(400).json({ message: err.message || 'خطأ في رفع الملف.' });
   }
   next(err);
+});
+
+// ============ ADMIN ENDPOINTS ============
+// كلهم محميين بـ verifyAdmin — لازم Authorization: Bearer <token> بتوكن أدمن
+
+// إحصائيات عامة للداشبورد
+app.get('/admin/stats', verifyAdmin, (req, res) => {
+  const db = readDB();
+  const users = db.users || [];
+  res.json({
+    totalUsers: users.length,
+    totalClients: users.filter((u) => u.role === 'client').length,
+    totalPros: users.filter((u) => u.role === 'pro').length,
+    pendingApprovals: users.filter((u) => u.status === 'pending').length,
+    blockedUsers: users.filter((u) => u.status === 'blocked').length,
+    totalBookings: (db.bookings || []).length,
+    totalReviews: (db.reviews || []).length,
+  });
+});
+
+// كل المستخدمين + فلاتر (role, status, search بالاسم/الإيميل/الرقم القومي)
+app.get('/admin/users', verifyAdmin, (req, res) => {
+  const db = readDB();
+  let users = db.users || [];
+  const { role, status, search } = req.query;
+
+  if (role) users = users.filter((u) => u.role === role);
+  if (status) users = users.filter((u) => (u.status ?? 'active') === status);
+  if (search) {
+    const q = String(search).toLowerCase();
+    users = users.filter(
+      (u) =>
+        u.fullName?.toLowerCase().includes(q) ||
+        u.email?.toLowerCase().includes(q) ||
+        u.nationalId?.includes(q)
+    );
+  }
+
+  res.json(users.map(sanitizeUser));
+});
+
+// تفاصيل مستخدم واحد + بروفايل الصنايعي (لو pro) — عشان الأدمن يشوف صور التحقق
+app.get('/admin/users/:id', verifyAdmin, (req, res) => {
+  const db = readDB();
+  const user = (db.users || []).find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ message: 'مش لاقي المستخدم ده.' });
+
+  const worker =
+    user.role === 'pro' ? (db.workers || []).find((w) => w.userId === user.id) : null;
+
+  res.json({ user: sanitizeUser(user), worker });
+});
+
+// تغيير حالة مستخدم — accept / reject / block / unblock
+app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
+  const { status } = req.body;
+  const validStatuses = ['pending', 'active', 'rejected', 'blocked'];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ message: 'الحالة المطلوبة مش صحيحة.' });
+  }
+
+  const db = readDB();
+  const index = (db.users || []).findIndex((u) => u.id === req.params.id);
+  if (index === -1) return res.status(404).json({ message: 'مش لاقي المستخدم ده.' });
+
+  db.users[index].status = status;
+  writeDB(db);
+  res.json(sanitizeUser(db.users[index]));
+});
+
+// ⚠️ Endpoint مؤقت لعمل أول حساب أدمن بس — استخدمه مرة واحدة وبعدين شيل
+// ADMIN_BOOTSTRAP_SECRET من الـ environment variables في Railway عشان يتعطل تلقائيًا.
+// لو الـ secret مش موجود أو غلط، بنرجع 404 (مش 401/403) عشان محدش يعرف أصلاً إن الـ endpoint موجود.
+app.post('/admin/bootstrap', async (req, res) => {
+  if (!BOOTSTRAP_SECRET || req.headers['x-bootstrap-secret'] !== BOOTSTRAP_SECRET) {
+    return res.status(404).json({ message: 'Not Found' });
+  }
+
+  const { email, password, fullName } = req.body;
+  if (!email || !password || !fullName) {
+    return res.status(400).json({ message: 'بيانات ناقصة.' });
+  }
+
+  const db = readDB();
+  if (db.users.find((u) => u.role === 'admin')) {
+    return res.status(409).json({ message: 'فيه أدمن متعمل بالفعل.' });
+  }
+
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const admin = {
+    id: crypto.randomUUID(),
+    email,
+    password: hashedPassword,
+    fullName,
+    role: 'admin',
+    status: 'active',
+    createdAt: new Date().toISOString(),
+  };
+  db.users.push(admin);
+  writeDB(db);
+  res.status(201).json({ message: 'اتعمل الأدمن بنجاح.' });
 });
 
 // ============ باقي الـ collections ============
