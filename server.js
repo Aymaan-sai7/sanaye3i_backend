@@ -9,15 +9,11 @@ const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const app = express();
 
-// ⚠️ غيّر ده لدومين الفرونت إند بتاعك الحقيقي وقت الديبلوي
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:4200';
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
 
-// ⚠️ لازم تضيفه كـ environment variable في Railway (Variables tab)، متسيبوش هنا في production
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
-
-// ⚠️ سيكريت مؤقت لعمل أول حساب أدمن بس — لو مش موجود كـ env var، endpoint البوتستراب بيتعطل تلقائيًا (بيرجع 404)
 const BOOTSTRAP_SECRET = process.env.ADMIN_BOOTSTRAP_SECRET;
 
 const DB_FILE = process.env.RAILWAY_VOLUME_MOUNT_PATH
@@ -29,8 +25,9 @@ if (!fs.existsSync(DB_FILE)) {
   fs.writeFileSync(DB_FILE, JSON.stringify(initialData, null, 2));
 }
 
-// ⚠️ لو الـ Volume عندك متعمل من قبل وفيه بيانات، لازم نضيف مصفوفة notifications
-// فاضية لو مش موجودة أصلاً في db.json القديم (وإلا أي كتابة عليها هترمي error)
+function readDB() { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+function writeDB(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
+
 function ensureNotificationsCollection() {
   const db = readDB();
   if (!db.notifications) {
@@ -40,10 +37,6 @@ function ensureNotificationsCollection() {
 }
 ensureNotificationsCollection();
 
-function readDB() { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-function writeDB(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
-
-// مجلد رفع الملفات — جوه نفس الـ Volume عشان يفضل موجود بعد أي redeploy
 const UPLOADS_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/uploads`
   : './uploads';
@@ -62,7 +55,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB لكل ملف
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
     if (!allowed.includes(file.mimetype)) {
@@ -72,10 +65,8 @@ const upload = multer({
   },
 });
 
-// السماح بالوصول للملفات المرفوعة (عرض الصور)
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// بيشيل الباسورد قبل ما نرجع أي user object للفرونت إند
 function sanitizeUser(user) {
   const { password, ...safe } = user;
   return safe;
@@ -84,24 +75,21 @@ function sanitizeUser(user) {
 // ============ AUTH ENDPOINTS ============
 
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 دقيقة
+  windowMs: 15 * 60 * 1000,
   max: 5,
   message: { message: 'محاولات كتير غلط، حاول تاني بعد شوية.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// حد أعلى وأخف على التسجيل — يمنع إنشاء حسابات سبام بالجملة من نفس الـ IP
 const registerLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // ساعة
+  windowMs: 60 * 60 * 1000,
   max: 10,
   message: { message: 'محاولات تسجيل كتير، حاول تاني بعد شوية.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// ── التسجيل: عملية واحدة atomic — user + worker profile (لو pro) بيتكتبوا مع بعض ──
-// ⚠️ كل حساب جديد بيتعمل بـ status: 'pending' ومبيرجعش token — لازم موافقة أدمن الأول
 app.post('/auth/register', registerLimiter, async (req, res) => {
   try {
     const { email, password, fullName, role, nationalId, workerData } = req.body;
@@ -129,7 +117,6 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
       return res.status(409).json({ message: 'البريد الإلكتروني ده مسجل بالفعل.' });
     }
 
-    // فحص الرقم القومي بغض النظر عن الدور — بيمنع نفس الشخص يسجل كـ client وpro مع بعض
     const nationalIdExists = db.users.find((u) => u.nationalId === nationalId);
     if (nationalIdExists) {
       return res.status(409).json({ message: 'الرقم القومي ده مسجل بحساب تاني بالفعل.' });
@@ -147,7 +134,6 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    // لو pro، بنجهز بيانات الـ worker الأول قبل أي كتابة فعلية على الملف
     let newWorker = null;
     if (role === 'pro') {
       newWorker = {
@@ -162,24 +148,18 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
         serviceRadius: Number(workerData.serviceRadius) || 15,
         rating: 0,
         reviewsCount: 0,
-        isAvailable: true,
+        // ⚠️ false من الأول — هتتفعّل تلقائي لما الأدمن يوافق (شوف /admin/users/:id/status تحت)
+        isAvailable: false,
         completedJobs: 0,
         bio: workerData.bio ?? '',
         avatarColor: workerData.avatarColor ?? '#2563EB',
       };
     }
 
-    // الكتابة الفعلية بتحصل مرة واحدة بس، بعد ما كل حاجة جاهزة —
-    // يعني إما الاتنين يتسجلوا مع بعض، أو محدش يتسجل خالص
     db.users.push(newUser);
     if (newWorker) db.workers.push(newWorker);
     writeDB(db);
 
-    // ⚠️ مفيش session token هنا خالص — الحساب pending لحد ما الأدمن يوافق عليه.
-    // بس لو pro، بنرجّع docsUploadToken قصير العمر (15 دقيقة) غرضه الوحيد إنه
-    // يسمح للفرونت إند يرفع مستندات التحقق فورًا بعد التسجيل. ده مش session
-    // token — الفرونت إند ميحفظهوش في localStorage/sessionStorage ولا
-    // بيستخدمه كـ "تسجيل دخول"، بيستخدمه مرة واحدة بس في نفس الطلب ده ويرميه
     const docsUploadToken = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, {
       expiresIn: '15m',
     });
@@ -205,10 +185,6 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
     const db = readDB();
     const user = db.users.find((u) => u.email === email);
 
-    // ⚠️ ملاحظة أمان: فصلنا رسالة "الإيميل مش موجود" عن "الباسورد غلط" بناءً على
-    // طلب صريح لتحسين تجربة الاستخدام. ده بيسهّل على أي حد يعرف الإيميلات
-    // المسجلة فعليًا (user enumeration)، بس مقبول لمشروع تخرج مش بيتعامل مع
-    // بيانات حساسة. لو حبيت ترجعها موحدة تاني، رجّع الرسالتين لنفس النص.
     if (!user) {
       return res.status(401).json({ message: 'الحساب ده مش موجود، سجل حساب جديد الأول.' });
     }
@@ -218,9 +194,6 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
       return res.status(401).json({ message: 'كلمة المرور غلط.' });
     }
 
-    // ⚠️ فحص الـ status بعد نجاح الباسورد — لاحظ إننا بنرفض حالات معينة بس (مش
-    // بنشترط status === 'active')، عشان أي حساب قديم اتعمل قبل إضافة الحقل ده
-    // (status يبقى undefined) يفضل يشتغل عادي من غير ما نحتاج migration script
     if (user.status === 'pending') {
       return res.status(403).json({ message: 'حسابك لسه قيد المراجعة من الأدمن، هنبلغك أول ما يتم قبوله.' });
     }
@@ -238,7 +211,6 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
   }
 });
 
-// ── Middleware للتحقق من JWT ──
 function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -255,7 +227,6 @@ function verifyToken(req, res, next) {
   }
 }
 
-// ── Middleware إضافي فوق verifyToken — بيتأكد إن الدور admin بالظبط ──
 function verifyAdmin(req, res, next) {
   verifyToken(req, res, () => {
     if (req.userRole !== 'admin') {
@@ -265,7 +236,6 @@ function verifyAdmin(req, res, next) {
   });
 }
 
-// ── Endpoint رفع مستندات التحقق (محمي بـ JWT) ────────────
 app.post(
   '/workers/:workerId/verification-docs',
   verifyToken,
@@ -280,7 +250,6 @@ app.post(
       const worker = db.workers.find((w) => w.id === req.params.workerId);
       if (!worker) return res.status(404).json({ message: 'مش لاقي بيانات الصنايعي.' });
 
-      // تأكيد إن اللي بيرفع هو نفسه صاحب البروفايل
       if (worker.userId !== req.userId) {
         return res.status(403).json({ message: 'مش مسموحلك بالتعديل ده.' });
       }
@@ -304,7 +273,6 @@ app.post(
   }
 );
 
-// معالج أخطاء multer (نوع ملف غلط / حجم كبير) — لازم يتحط بعد الـ routes
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError || err.message?.includes('نوع الملف')) {
     return res.status(400).json({ message: err.message || 'خطأ في رفع الملف.' });
@@ -313,9 +281,7 @@ app.use((err, req, res, next) => {
 });
 
 // ============ ADMIN ENDPOINTS ============
-// كلهم محميين بـ verifyAdmin — لازم Authorization: Bearer <token> بتوكن أدمن
 
-// إحصائيات عامة للداشبورد
 app.get('/admin/stats', verifyAdmin, (req, res) => {
   const db = readDB();
   const users = db.users || [];
@@ -330,7 +296,6 @@ app.get('/admin/stats', verifyAdmin, (req, res) => {
   });
 });
 
-// كل المستخدمين + فلاتر (role, status, search بالاسم/الإيميل/الرقم القومي)
 app.get('/admin/users', verifyAdmin, (req, res) => {
   const db = readDB();
   let users = db.users || [];
@@ -351,7 +316,6 @@ app.get('/admin/users', verifyAdmin, (req, res) => {
   res.json(users.map(sanitizeUser));
 });
 
-// تفاصيل مستخدم واحد + بروفايل الصنايعي (لو pro) — عشان الأدمن يشوف صور التحقق
 app.get('/admin/users/:id', verifyAdmin, (req, res) => {
   const db = readDB();
   const user = (db.users || []).find((u) => u.id === req.params.id);
@@ -364,6 +328,7 @@ app.get('/admin/users/:id', verifyAdmin, (req, res) => {
 });
 
 // تغيير حالة مستخدم — accept / reject / block / unblock
+// ⚠️ لو صنايعي، بنزامن worker.isAvailable مع الحالة الجديدة تلقائيًا
 app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   const { status } = req.body;
   const validStatuses = ['pending', 'active', 'rejected', 'blocked'];
@@ -372,17 +337,22 @@ app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   }
 
   const db = readDB();
-  const index = (db.users || []).findIndex((u) => u.id === req.params.id);
-  if (index === -1) return res.status(404).json({ message: 'مش لاقي المستخدم ده.' });
+  const user = (db.users || []).find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ message: 'مش لاقي المستخدم ده.' });
 
-  db.users[index].status = status;
+  user.status = status;
+
+  if (user.role === 'pro') {
+    const worker = (db.workers || []).find((w) => w.userId === user.id);
+    if (worker) {
+      worker.isAvailable = status === 'active';
+    }
+  }
+
   writeDB(db);
-  res.json(sanitizeUser(db.users[index]));
+  res.json(sanitizeUser(user));
 });
 
-// ⚠️ Endpoint مؤقت لعمل أول حساب أدمن بس — استخدمه مرة واحدة وبعدين شيل
-// ADMIN_BOOTSTRAP_SECRET من الـ environment variables في Railway عشان يتعطل تلقائيًا.
-// لو الـ secret مش موجود أو غلط، بنرجع 404 (مش 401/403) عشان محدش يعرف أصلاً إن الـ endpoint موجود.
 app.post('/admin/bootstrap', async (req, res) => {
   if (!BOOTSTRAP_SECRET || req.headers['x-bootstrap-secret'] !== BOOTSTRAP_SECRET) {
     return res.status(404).json({ message: 'Not Found' });
@@ -414,27 +384,30 @@ app.post('/admin/bootstrap', async (req, res) => {
 });
 
 // ============ باقي الـ collections ============
-// ⚠️ لاحظ إننا شلنا 'users' من هنا خالص عشان محدش يقدر يعمل GET /users
-// ويشوف كل المستخدمين بالباسورد الحقيقي بتاعهم
 const collections = ['workers', 'bookings', 'reviews', 'messages', 'conversations', 'notifications'];
-
-// query params بتبدأ بـ _ دي أوامر خاصة (ترتيب/تحديد عدد) زي json-server،
-// مش فلاتر بيانات فعلية — لازم نستثنيهم من الفلترة العادية
 const SPECIAL_QUERY_KEYS = ['_sort', '_order', '_limit', '_page'];
 
+// ⚠️⚠️ الفيكس الحرج: أي GET عام على /workers لازم يستثني أي صنايعي
+// الـ user المرتبط بيه status != 'active' — وإلا صنايعية pending/blocked/rejected
+// هيفضلوا ظاهرين للعملاء في find-services وكأن حسابهم متوافق عليه فعليًا
 collections.forEach((collection) => {
   app.get(`/${collection}`, (req, res) => {
     const db = readDB();
     let items = db[collection] || [];
     const query = req.query;
 
-    // فلترة عادية (equality) — بتتجاهل الـ special keys
+    if (collection === 'workers') {
+      items = items.filter((worker) => {
+        const owner = (db.users || []).find((u) => u.id === worker.userId);
+        return !owner || owner.status === 'active';
+      });
+    }
+
     Object.keys(query).forEach((key) => {
       if (SPECIAL_QUERY_KEYS.includes(key)) return;
       items = items.filter((item) => String(item[key]) === String(query[key]));
     });
 
-    // ترتيب (زي json-server: ?_sort=createdAt&_order=desc)
     if (query._sort) {
       const order = query._order === 'desc' ? -1 : 1;
       items = [...items].sort((a, b) => {
@@ -445,7 +418,6 @@ collections.forEach((collection) => {
       });
     }
 
-    // تحديد عدد النتائج (زي json-server: ?_limit=20)
     if (query._limit) {
       items = items.slice(0, Number(query._limit));
     }
@@ -454,11 +426,21 @@ collections.forEach((collection) => {
   });
 });
 
+// ⚠️ نفس الفكرة على /workers/:id — وإلا حد يقدر يوصل لبروفايل صنايعي pending
+// مباشرة لو عرف رابط الـ id بتاعه (مثلاً لو حفظ اللينك قبل ما يتقبل)
 collections.forEach((collection) => {
   app.get(`/${collection}/:id`, (req, res) => {
     const db = readDB();
     const item = (db[collection] || []).find((x) => String(x.id) === req.params.id);
     if (!item) return res.status(404).json({ message: 'Not Found' });
+
+    if (collection === 'workers') {
+      const owner = (db.users || []).find((u) => u.id === item.userId);
+      if (owner && owner.status !== 'active') {
+        return res.status(404).json({ message: 'Not Found' });
+      }
+    }
+
     res.json(item);
   });
 });
