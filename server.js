@@ -7,6 +7,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
+const nodemailer = require('nodemailer');
 const app = express();
 
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:4200';
@@ -68,8 +69,39 @@ const upload = multer({
 app.use('/uploads', express.static(UPLOADS_DIR));
 
 function sanitizeUser(user) {
-  const { password, ...safe } = user;
+  const { password, resetPasswordToken, resetPasswordExpiry, ...safe } = user;
   return safe;
+}
+
+// ============ EMAIL (Brevo SMTP) ============
+// ⚠️ متغيرات البيئة المطلوبة على Railway:
+// BREVO_SMTP_LOGIN, BREVO_SMTP_KEY, BREVO_SENDER_EMAIL
+const emailTransporter = nodemailer.createTransport({
+  host: 'smtp-relay.brevo.com',
+  port: 587,
+  auth: {
+    user: process.env.BREVO_SMTP_LOGIN,
+    pass: process.env.BREVO_SMTP_KEY,
+  },
+});
+
+async function sendResetPasswordEmail(toEmail, fullName, resetLink) {
+  await emailTransporter.sendMail({
+    from: `"صنايعي" <${process.env.BREVO_SENDER_EMAIL}>`,
+    to: toEmail,
+    subject: 'إعادة تعيين كلمة المرور - صنايعي',
+    html: `
+      <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
+        <h2 style="color: #2563EB;">صنايعي</h2>
+        <p>أهلاً ${fullName || ''}،</p>
+        <p>وصلنا طلب لإعادة تعيين كلمة المرور بتاعة حسابك. اضغط على الزرار ده عشان تعمل باسورد جديد:</p>
+        <a href="${resetLink}" style="display:inline-block; background:#2563EB; color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; margin: 16px 0;">
+          إعادة تعيين كلمة المرور
+        </a>
+        <p style="color:#94A3B8; font-size:13px;">الرابط ده هيشتغل لمدة ساعة واحدة بس. لو مطلبتش تغيير الباسورد، تجاهل الإيميل ده.</p>
+      </div>
+    `,
+  });
 }
 
 // ============ AUTH ENDPOINTS ============
@@ -86,6 +118,14 @@ const registerLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 10,
   message: { message: 'محاولات تسجيل كتير، حاول تاني بعد شوية.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const forgotPasswordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { message: 'محاولات كتير، حاول تاني بعد شوية.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -206,6 +246,95 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
 
     const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ user: sanitizeUser(user), token });
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+// ============ FORGOT / RESET PASSWORD ============
+
+app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ message: 'من فضلك أدخل البريد الإلكتروني.' });
+    }
+
+    const db = readDB();
+    const user = db.users.find((u) => u.email === email);
+
+    // ⚠️ رد عام بغض النظر لو الإيميل موجود ولا لأ — عشان محدش يقدر يتأكد
+    // مين مسجل عندنا من غيره (نفس المبدأ اللي بنتبعه في register أصلاً)
+    const genericResponse = {
+      message: 'لو البريد الإلكتروني ده مسجل عندنا، هيوصلك لينك لإعادة تعيين كلمة المرور.',
+    };
+
+    if (!user) {
+      return res.json(genericResponse);
+    }
+
+    // توكن عشوائي طويل، بنبعت الـ raw token في الإيميل وبنخزن نسخة hashed بس
+    // (زي الباسورد بالظبط) — عشان لو حد وصل لـ db.json مايقدرش يستخدم التوكنات المخزنة
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    user.resetPasswordToken = hashedToken;
+    user.resetPasswordExpiry = Date.now() + 60 * 60 * 1000; // ساعة واحدة
+    writeDB(db);
+
+    const resetLink = `${ALLOWED_ORIGIN}/reset-password?token=${rawToken}&email=${encodeURIComponent(email)}`;
+
+    try {
+      await sendResetPasswordEmail(email, user.fullName, resetLink);
+    } catch (emailErr) {
+      // لو فشل إرسال الإيميل، منسيبش المستخدم يعرف (عشان مانكشفش وجود الحساب) —
+      // بس بنلوج الخطأ عندنا عشان نلاحظه
+      console.error('Failed to send reset email:', emailErr);
+    }
+
+    res.json(genericResponse);
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+app.post('/auth/reset-password', async (req, res) => {
+  try {
+    const { email, token, newPassword } = req.body;
+
+    if (!email || !token || !newPassword) {
+      return res.status(400).json({ message: 'بيانات ناقصة.' });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ message: 'الباسورد لازم يكون 8 حروف على الأقل.' });
+    }
+
+    const db = readDB();
+    const user = db.users.find((u) => u.email === email);
+
+    if (!user || !user.resetPasswordToken || !user.resetPasswordExpiry) {
+      return res.status(400).json({ message: 'الرابط ده غير صالح أو مستخدم قبل كده.' });
+    }
+
+    if (Date.now() > user.resetPasswordExpiry) {
+      delete user.resetPasswordToken;
+      delete user.resetPasswordExpiry;
+      writeDB(db);
+      return res.status(400).json({ message: 'الرابط ده منتهي، اطلب لينك جديد.' });
+    }
+
+    const hashedIncoming = crypto.createHash('sha256').update(token).digest('hex');
+    if (hashedIncoming !== user.resetPasswordToken) {
+      return res.status(400).json({ message: 'الرابط ده غير صالح.' });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    // التوكن بيتحرق بعد الاستخدام — نفس فكرة الـ single-use
+    delete user.resetPasswordToken;
+    delete user.resetPasswordExpiry;
+    writeDB(db);
+
+    res.json({ message: 'تم تغيير كلمة المرور بنجاح، سجل دخولك بالباسورد الجديد.' });
   } catch (err) {
     res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
   }
