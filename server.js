@@ -7,7 +7,6 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
-const nodemailer = require('nodemailer');
 const app = express();
 
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:4200';
@@ -73,24 +72,25 @@ function sanitizeUser(user) {
   return safe;
 }
 
-// ============ EMAIL (Brevo SMTP) ============
+// ============ EMAIL (Brevo HTTP API) ============
+// ⚠️ بنستخدم الـ HTTP API بدل SMTP عمدًا — كتير من منصات الاستضافة (زي Railway)
+// بتحجب أو بتقيّد بورتات SMTP التقليدية (587/465/25) كإجراء ضد الـ spam، فالاتصال
+// بيعمل timeout. الـ API بيشتغل عن طريق HTTPS العادي (بورت 443) اللي مش محجوب أبدًا.
 // ⚠️ متغيرات البيئة المطلوبة على Railway:
-// BREVO_SMTP_LOGIN, BREVO_SMTP_KEY, BREVO_SENDER_EMAIL
-const emailTransporter = nodemailer.createTransport({
-  host: 'smtp-relay.brevo.com',
-  port: 587,
-  auth: {
-    user: process.env.BREVO_SMTP_LOGIN,
-    pass: process.env.BREVO_SMTP_KEY,
-  },
-});
-
+// BREVO_API_KEY, BREVO_SENDER_EMAIL
 async function sendResetPasswordEmail(toEmail, fullName, resetLink) {
-  await emailTransporter.sendMail({
-    from: `"صنايعي" <${process.env.BREVO_SENDER_EMAIL}>`,
-    to: toEmail,
-    subject: 'إعادة تعيين كلمة المرور - صنايعي',
-    html: `
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'api-key': process.env.BREVO_API_KEY,
+    },
+    body: JSON.stringify({
+      sender: { name: 'صنايعي', email: process.env.BREVO_SENDER_EMAIL },
+      to: [{ email: toEmail, name: fullName || toEmail }],
+      subject: 'إعادة تعيين كلمة المرور - صنايعي',
+      htmlContent: `
       <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
         <h2 style="color: #2563EB;">صنايعي</h2>
         <p>أهلاً ${fullName || ''}،</p>
@@ -100,8 +100,14 @@ async function sendResetPasswordEmail(toEmail, fullName, resetLink) {
         </a>
         <p style="color:#94A3B8; font-size:13px;">الرابط ده هيشتغل لمدة ساعة واحدة بس. لو مطلبتش تغيير الباسورد، تجاهل الإيميل ده.</p>
       </div>
-    `,
+      `,
+    }),
   });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Brevo API error (${response.status}): ${errorBody}`);
+  }
 }
 
 // ============ AUTH ENDPOINTS ============
