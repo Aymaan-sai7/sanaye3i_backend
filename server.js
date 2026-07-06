@@ -138,7 +138,7 @@ const forgotPasswordLimiter = rateLimit({
 
 app.post('/auth/register', registerLimiter, async (req, res) => {
   try {
-    const { email, password, fullName, role, nationalId, workerData } = req.body;
+    const { email, password, fullName, role, nationalId, mobileNumber, workerData } = req.body;
 
     if (!email || !password || !fullName || !role) {
       return res.status(400).json({ message: 'بيانات ناقصة.' });
@@ -154,6 +154,9 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     }
     if (!nationalId || !/^\d{14}$/.test(nationalId)) {
       return res.status(400).json({ message: 'الرقم القومي لازم يكون 14 رقم صحيح.' });
+    }
+    if (!mobileNumber || !/^01[0125]\d{8}$/.test(mobileNumber)) {
+      return res.status(400).json({ message: 'رقم الموبايل غير صحيح.' });
     }
 
     const db = readDB();
@@ -176,6 +179,7 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
       fullName,
       role,
       nationalId,
+      mobileNumber, // ⚠️ جديد
       status: 'pending',
       createdAt: new Date().toISOString(),
     };
@@ -613,7 +617,7 @@ collections.forEach((collection) => {
   });
 });
 
-app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
+app.get('/', (req, res) => res.send('Sanaye3i Backend is Running '));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));
