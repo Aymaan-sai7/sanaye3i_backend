@@ -7,6 +7,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
+const http = require('http');
+const { Server } = require('socket.io');
 const app = express();
 
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:4200';
@@ -70,6 +72,41 @@ app.use('/uploads', express.static(UPLOADS_DIR));
 function sanitizeUser(user) {
   const { password, resetPasswordToken, resetPasswordExpiry, ...safe } = user;
   return safe;
+}
+
+// ============ WEBSOCKET (Socket.IO) ============
+// ⚠️ جديد: بنستخدم نفس الـ HTTP server بتاع Express (مش سيرفر منفصل)،
+// عشان يشتغل عادي على Railway من غير أي إعداد أو تكلفة إضافية —
+// الاتصال بيمر على نفس البورت والدومين بتاع الـ backend الحالي
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: ALLOWED_ORIGIN },
+});
+
+// أي اتصال socket لازم يبعت توكن أدمن صالح، وإلا بيترفض فورًا
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error('unauthorized'));
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.role !== 'admin') return next(new Error('forbidden'));
+    socket.userId = decoded.id;
+    next();
+  } catch {
+    next(new Error('unauthorized'));
+  }
+});
+
+io.on('connection', (socket) => {
+  // كل الأدمنز في room واحدة عشان نبعتلهم كلهم مع بعض بضربة واحدة
+  socket.join('admins');
+});
+
+// بتحسب عدد الـ pending الحقيقي من الـ DB وتبعته لكل الأدمنز المتصلين حاليًا
+function broadcastPendingApprovals() {
+  const db = readDB();
+  const pendingApprovals = (db.users || []).filter((u) => u.status === 'pending').length;
+  io.to('admins').emit('admin:pendingApprovalsChanged', { pendingApprovals });
 }
 
 // ============ EMAIL (Brevo HTTP API) ============
@@ -179,7 +216,7 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
       fullName,
       role,
       nationalId,
-      mobileNumber, // ⚠️ جديد
+      mobileNumber,
       status: 'pending',
       createdAt: new Date().toISOString(),
     };
@@ -198,7 +235,6 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
         serviceRadius: Number(workerData.serviceRadius) || 15,
         rating: 0,
         reviewsCount: 0,
-        // ⚠️ false من الأول — هتتفعّل تلقائي لما الأدمن يوافق (شوف /admin/users/:id/status تحت)
         isAvailable: false,
         completedJobs: 0,
         bio: workerData.bio ?? '',
@@ -209,6 +245,9 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     db.users.push(newUser);
     if (newWorker) db.workers.push(newWorker);
     writeDB(db);
+
+    // ⚠️ جديد: حساب جديد اتعمل بحالة pending → نبلّغ كل الأدمنز المتصلين فورًا
+    broadcastPendingApprovals();
 
     const docsUploadToken = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, {
       expiresIn: '15m',
@@ -273,8 +312,6 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
     const db = readDB();
     const user = db.users.find((u) => u.email === email);
 
-    // ⚠️ رد عام بغض النظر لو الإيميل موجود ولا لأ — عشان محدش يقدر يتأكد
-    // مين مسجل عندنا من غيره (نفس المبدأ اللي بنتبعه في register أصلاً)
     const genericResponse = {
       message: 'لو البريد الإلكتروني ده مسجل عندنا، هيوصلك لينك لإعادة تعيين كلمة المرور.',
     };
@@ -283,13 +320,11 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
       return res.json(genericResponse);
     }
 
-    // توكن عشوائي طويل، بنبعت الـ raw token في الإيميل وبنخزن نسخة hashed بس
-    // (زي الباسورد بالظبط) — عشان لو حد وصل لـ db.json مايقدرش يستخدم التوكنات المخزنة
     const rawToken = crypto.randomBytes(32).toString('hex');
     const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
 
     user.resetPasswordToken = hashedToken;
-    user.resetPasswordExpiry = Date.now() + 60 * 60 * 1000; // ساعة واحدة
+    user.resetPasswordExpiry = Date.now() + 60 * 60 * 1000;
     writeDB(db);
 
     const resetLink = `${ALLOWED_ORIGIN}/reset-password?token=${rawToken}&email=${encodeURIComponent(email)}`;
@@ -297,8 +332,6 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
     try {
       await sendResetPasswordEmail(email, user.fullName, resetLink);
     } catch (emailErr) {
-      // لو فشل إرسال الإيميل، منسيبش المستخدم يعرف (عشان مانكشفش وجود الحساب) —
-      // بس بنلوج الخطأ عندنا عشان نلاحظه
       console.error('Failed to send reset email:', emailErr);
     }
 
@@ -339,7 +372,6 @@ app.post('/auth/reset-password', async (req, res) => {
     }
 
     user.password = await bcrypt.hash(newPassword, 10);
-    // التوكن بيتحرق بعد الاستخدام — نفس فكرة الـ single-use
     delete user.resetPasswordToken;
     delete user.resetPasswordExpiry;
     writeDB(db);
@@ -466,8 +498,6 @@ app.get('/admin/users/:id', verifyAdmin, (req, res) => {
   res.json({ user: sanitizeUser(user), worker });
 });
 
-// تغيير حالة مستخدم — accept / reject / block / unblock
-// ⚠️ لو صنايعي، بنزامن worker.isAvailable مع الحالة الجديدة تلقائيًا
 app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   const { status } = req.body;
   const validStatuses = ['pending', 'active', 'rejected', 'blocked'];
@@ -489,6 +519,10 @@ app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   }
 
   writeDB(db);
+
+  // ⚠️ جديد: الحالة اتغيّرت (قبول/رفض/حظر) → نحدّث كل الأدمنز المتصلين بالرقم الحقيقي
+  broadcastPendingApprovals();
+
   res.json(sanitizeUser(user));
 });
 
@@ -526,9 +560,6 @@ app.post('/admin/bootstrap', async (req, res) => {
 const collections = ['workers', 'bookings', 'reviews', 'messages', 'conversations', 'notifications'];
 const SPECIAL_QUERY_KEYS = ['_sort', '_order', '_limit', '_page'];
 
-// ⚠️⚠️ الفيكس الحرج: أي GET عام على /workers لازم يستثني أي صنايعي
-// الـ user المرتبط بيه status != 'active' — وإلا صنايعية pending/blocked/rejected
-// هيفضلوا ظاهرين للعملاء في find-services وكأن حسابهم متوافق عليه فعليًا
 collections.forEach((collection) => {
   app.get(`/${collection}`, (req, res) => {
     const db = readDB();
@@ -565,8 +596,6 @@ collections.forEach((collection) => {
   });
 });
 
-// ⚠️ نفس الفكرة على /workers/:id — وإلا حد يقدر يوصل لبروفايل صنايعي pending
-// مباشرة لو عرف رابط الـ id بتاعه (مثلاً لو حفظ اللينك قبل ما يتقبل)
 collections.forEach((collection) => {
   app.get(`/${collection}/:id`, (req, res) => {
     const db = readDB();
@@ -617,7 +646,8 @@ collections.forEach((collection) => {
   });
 });
 
-app.get('/', (req, res) => res.send('Sanaye3i Backend is Running '));
+app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+// ⚠️ اتغيّر من app.listen لـ server.listen عشان socket.io يشتغل على نفس البورت
+server.listen(port, () => console.log(`Server running on port ${port}`));
