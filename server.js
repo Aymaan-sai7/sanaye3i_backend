@@ -7,9 +7,14 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
-const http = require('http');
-const { Server } = require('socket.io');
 const app = express();
+
+// ⚠️ Railway (وأي منصة استضافة بتحط السيرفر ورا proxy) بتبعت هيدر X-Forwarded-For
+// عشان توضح الـ IP الحقيقي بتاع الزائر. من غير السطر ده، express-rate-limit
+// مش هيوثق في الهيدر ده، وده ممكن يخلي الـ rate limiting (على login/register/
+// forgot-password) يشتغل غلط. الرقم 1 معناه "وثّق في أول proxy واحد بس"
+// (وده بالظبط عدد الـ proxies اللي Railway بيحط سيرفرك وراهم)
+app.set('trust proxy', 1);
 
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:4200';
 app.use(cors({ origin: ALLOWED_ORIGIN }));
@@ -38,6 +43,17 @@ function ensureNotificationsCollection() {
   }
 }
 ensureNotificationsCollection();
+
+// ⚠️ كوليكشن الكوبونات الجديدة — لو قاعدة البيانات عندك اتعملت قبل كده
+// ومفيهاش coupons، بنضيفها هنا أول مرة السيرفر يشتغل
+function ensureCouponsCollection() {
+  const db = readDB();
+  if (!db.coupons) {
+    db.coupons = [];
+    writeDB(db);
+  }
+}
+ensureCouponsCollection();
 
 const UPLOADS_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/uploads`
@@ -72,41 +88,6 @@ app.use('/uploads', express.static(UPLOADS_DIR));
 function sanitizeUser(user) {
   const { password, resetPasswordToken, resetPasswordExpiry, ...safe } = user;
   return safe;
-}
-
-// ============ WEBSOCKET (Socket.IO) ============
-// ⚠️ جديد: بنستخدم نفس الـ HTTP server بتاع Express (مش سيرفر منفصل)،
-// عشان يشتغل عادي على Railway من غير أي إعداد أو تكلفة إضافية —
-// الاتصال بيمر على نفس البورت والدومين بتاع الـ backend الحالي
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: ALLOWED_ORIGIN },
-});
-
-// أي اتصال socket لازم يبعت توكن أدمن صالح، وإلا بيترفض فورًا
-io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
-  if (!token) return next(new Error('unauthorized'));
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded.role !== 'admin') return next(new Error('forbidden'));
-    socket.userId = decoded.id;
-    next();
-  } catch {
-    next(new Error('unauthorized'));
-  }
-});
-
-io.on('connection', (socket) => {
-  // كل الأدمنز في room واحدة عشان نبعتلهم كلهم مع بعض بضربة واحدة
-  socket.join('admins');
-});
-
-// بتحسب عدد الـ pending الحقيقي من الـ DB وتبعته لكل الأدمنز المتصلين حاليًا
-function broadcastPendingApprovals() {
-  const db = readDB();
-  const pendingApprovals = (db.users || []).filter((u) => u.status === 'pending').length;
-  io.to('admins').emit('admin:pendingApprovalsChanged', { pendingApprovals });
 }
 
 // ============ EMAIL (Brevo HTTP API) ============
@@ -175,7 +156,7 @@ const forgotPasswordLimiter = rateLimit({
 
 app.post('/auth/register', registerLimiter, async (req, res) => {
   try {
-    const { email, password, fullName, role, nationalId, mobileNumber, workerData } = req.body;
+    const { email, password, fullName, role, nationalId, workerData } = req.body;
 
     if (!email || !password || !fullName || !role) {
       return res.status(400).json({ message: 'بيانات ناقصة.' });
@@ -191,9 +172,6 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     }
     if (!nationalId || !/^\d{14}$/.test(nationalId)) {
       return res.status(400).json({ message: 'الرقم القومي لازم يكون 14 رقم صحيح.' });
-    }
-    if (!mobileNumber || !/^01[0125]\d{8}$/.test(mobileNumber)) {
-      return res.status(400).json({ message: 'رقم الموبايل غير صحيح.' });
     }
 
     const db = readDB();
@@ -216,7 +194,6 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
       fullName,
       role,
       nationalId,
-      mobileNumber,
       status: 'pending',
       createdAt: new Date().toISOString(),
     };
@@ -235,6 +212,7 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
         serviceRadius: Number(workerData.serviceRadius) || 15,
         rating: 0,
         reviewsCount: 0,
+        // ⚠️ false من الأول — هتتفعّل تلقائي لما الأدمن يوافق (شوف /admin/users/:id/status تحت)
         isAvailable: false,
         completedJobs: 0,
         bio: workerData.bio ?? '',
@@ -245,9 +223,6 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     db.users.push(newUser);
     if (newWorker) db.workers.push(newWorker);
     writeDB(db);
-
-    // ⚠️ جديد: حساب جديد اتعمل بحالة pending → نبلّغ كل الأدمنز المتصلين فورًا
-    broadcastPendingApprovals();
 
     const docsUploadToken = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, {
       expiresIn: '15m',
@@ -312,6 +287,8 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
     const db = readDB();
     const user = db.users.find((u) => u.email === email);
 
+    // ⚠️ رد عام بغض النظر لو الإيميل موجود ولا لأ — عشان محدش يقدر يتأكد
+    // مين مسجل عندنا من غيره (نفس المبدأ اللي بنتبعه في register أصلاً)
     const genericResponse = {
       message: 'لو البريد الإلكتروني ده مسجل عندنا، هيوصلك لينك لإعادة تعيين كلمة المرور.',
     };
@@ -320,11 +297,13 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
       return res.json(genericResponse);
     }
 
+    // توكن عشوائي طويل، بنبعت الـ raw token في الإيميل وبنخزن نسخة hashed بس
+    // (زي الباسورد بالظبط) — عشان لو حد وصل لـ db.json مايقدرش يستخدم التوكنات المخزنة
     const rawToken = crypto.randomBytes(32).toString('hex');
     const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
 
     user.resetPasswordToken = hashedToken;
-    user.resetPasswordExpiry = Date.now() + 60 * 60 * 1000;
+    user.resetPasswordExpiry = Date.now() + 60 * 60 * 1000; // ساعة واحدة
     writeDB(db);
 
     const resetLink = `${ALLOWED_ORIGIN}/reset-password?token=${rawToken}&email=${encodeURIComponent(email)}`;
@@ -332,6 +311,8 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
     try {
       await sendResetPasswordEmail(email, user.fullName, resetLink);
     } catch (emailErr) {
+      // لو فشل إرسال الإيميل، منسيبش المستخدم يعرف (عشان مانكشفش وجود الحساب) —
+      // بس بنلوج الخطأ عندنا عشان نلاحظه
       console.error('Failed to send reset email:', emailErr);
     }
 
@@ -372,6 +353,7 @@ app.post('/auth/reset-password', async (req, res) => {
     }
 
     user.password = await bcrypt.hash(newPassword, 10);
+    // التوكن بيتحرق بعد الاستخدام — نفس فكرة الـ single-use
     delete user.resetPasswordToken;
     delete user.resetPasswordExpiry;
     writeDB(db);
@@ -498,6 +480,8 @@ app.get('/admin/users/:id', verifyAdmin, (req, res) => {
   res.json({ user: sanitizeUser(user), worker });
 });
 
+// تغيير حالة مستخدم — accept / reject / block / unblock
+// ⚠️ لو صنايعي، بنزامن worker.isAvailable مع الحالة الجديدة تلقائيًا
 app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   const { status } = req.body;
   const validStatuses = ['pending', 'active', 'rejected', 'blocked'];
@@ -519,10 +503,6 @@ app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   }
 
   writeDB(db);
-
-  // ⚠️ جديد: الحالة اتغيّرت (قبول/رفض/حظر) → نحدّث كل الأدمنز المتصلين بالرقم الحقيقي
-  broadcastPendingApprovals();
-
   res.json(sanitizeUser(user));
 });
 
@@ -556,10 +536,283 @@ app.post('/admin/bootstrap', async (req, res) => {
   res.status(201).json({ message: 'اتعمل الأدمن بنجاح.' });
 });
 
-// ============ باقي الـ collections ============
+// ============ COUPONS (كوبونات الخصم) ============
+// ⚠️ القرارات المتفق عليها:
+// - نوع الخصم: نسبة مئوية أو مبلغ ثابت (الأدمن يختار وقت الإنشاء)
+// - حدود الاستخدام: حد إجمالي (maxTotalUses) + مرة واحدة لكل مستخدم (usedByUserIds)
+// - النطاق: ممكن يتخصص لتصنيف معين (tradeRestriction) أو يفضل عام (null)
+//
+// ⚠️ مهم: الـ endpoints دي بتدير الكوبون وبتتحقق منه بس (validate) — الاستهلاك
+// الفعلي (تسجيل الاستخدام + خصم السعر الحقيقي) بيحصل وقت إنشاء الحجز، وده
+// لسه معلّق لحد ما تجيلي ملفات الـ Booking model و bookings.service.ts وكومبوننت
+// "Review & Confirm" (شوف الملف المرجعي).
+
+function generateCouponCode() {
+  // كود من 8 حروف/أرقام، سهل القراءة (من غير حروف بتتلخبط زي 0/O أو 1/I)
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 8; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+// ── إدارة الكوبونات (أدمن بس) ──────────────────────────────
+
+app.get('/admin/coupons', verifyAdmin, (req, res) => {
+  const db = readDB();
+  res.json(db.coupons || []);
+});
+
+app.post('/admin/coupons', verifyAdmin, (req, res) => {
+  try {
+    const {
+      code,
+      discountType,
+      discountValue,
+      tradeRestriction, // TradeType أو null (يعني عام على كل التصنيفات)
+      maxTotalUses,     // رقم أو null (يعني مفيش حد إجمالي)
+      expiryDate,       // ISO date string أو null (يعني مفيش تاريخ انتهاء)
+    } = req.body;
+
+    if (!discountType || !['percentage', 'fixed'].includes(discountType)) {
+      return res.status(400).json({ message: 'نوع الخصم لازم يكون percentage أو fixed.' });
+    }
+    if (!discountValue || Number(discountValue) <= 0) {
+      return res.status(400).json({ message: 'قيمة الخصم لازم تكون رقم أكبر من صفر.' });
+    }
+    if (discountType === 'percentage' && Number(discountValue) > 100) {
+      return res.status(400).json({ message: 'نسبة الخصم مينفعش تتعدى 100%.' });
+    }
+
+    const db = readDB();
+    if (!db.coupons) db.coupons = [];
+
+    // لو الأدمن مبعتش كود، بنولّده تلقائي؛ لو بعت واحد بنوحده uppercase ونتأكد إنه فريد
+    const finalCode = (code ? String(code).trim().toUpperCase() : generateCouponCode());
+
+    const codeExists = db.coupons.find((c) => c.code === finalCode);
+    if (codeExists) {
+      return res.status(409).json({ message: 'الكود ده مستخدم بالفعل، جرب كود تاني.' });
+    }
+
+    const newCoupon = {
+      id: crypto.randomUUID(),
+      code: finalCode,
+      discountType,
+      discountValue: Number(discountValue),
+      tradeRestriction: tradeRestriction || null,
+      maxTotalUses: maxTotalUses != null ? Number(maxTotalUses) : null,
+      usedCount: 0,
+      usedByUserIds: [],
+      expiryDate: expiryDate || null,
+      isActive: true,
+      createdAt: new Date().toISOString(),
+    };
+
+    db.coupons.push(newCoupon);
+    writeDB(db);
+    res.status(201).json(newCoupon);
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+app.patch('/admin/coupons/:id', verifyAdmin, (req, res) => {
+  const db = readDB();
+  const coupon = (db.coupons || []).find((c) => c.id === req.params.id);
+  if (!coupon) return res.status(404).json({ message: 'مش لاقي الكوبون ده.' });
+
+  // ⚠️ بنسمح بتعديل الحقول دي بس — مش بنسمح تتعدل usedCount/usedByUserIds
+  // يدويًا من هنا عشان محدش يلخبط أرقام الاستخدام الحقيقية
+  const allowedFields = [
+    'discountType',
+    'discountValue',
+    'tradeRestriction',
+    'maxTotalUses',
+    'expiryDate',
+    'isActive',
+  ];
+  for (const field of allowedFields) {
+    if (field in req.body) {
+      coupon[field] = req.body[field];
+    }
+  }
+
+  writeDB(db);
+  res.json(coupon);
+});
+
+app.delete('/admin/coupons/:id', verifyAdmin, (req, res) => {
+  const db = readDB();
+  db.coupons = (db.coupons || []).filter((c) => c.id !== req.params.id);
+  writeDB(db);
+  res.json({ success: true });
+});
+
+// ── التحقق من كوبون (مش استهلاك) ─────────────────────────────
+// ⚠️ ده بيتنادى من خطوة "Review & Confirm" وقت ما المستخدم يكتب كود الكوبون،
+// عشان نوريله الخصم قبل ما يأكد الحجز فعليًا. الاستهلاك الحقيقي (تسجيل
+// usedCount + إضافة userId في usedByUserIds) بيحصل بس وقت تأكيد الحجز النهائي
+app.post('/coupons/validate', verifyToken, (req, res) => {
+  try {
+    const { code, trade } = req.body;
+    if (!code) {
+      return res.status(400).json({ valid: false, message: 'اكتب كود الكوبون الأول.' });
+    }
+
+    const db = readDB();
+    const coupon = (db.coupons || []).find(
+      (c) => c.code === String(code).trim().toUpperCase()
+    );
+
+    if (!coupon) {
+      return res.status(404).json({ valid: false, message: 'الكود ده مش موجود.' });
+    }
+    if (!coupon.isActive) {
+      return res.status(400).json({ valid: false, message: 'الكوبون ده مش شغال دلوقتي.' });
+    }
+    if (coupon.expiryDate && Date.now() > new Date(coupon.expiryDate).getTime()) {
+      return res.status(400).json({ valid: false, message: 'الكوبون ده منتهي الصلاحية.' });
+    }
+    if (coupon.tradeRestriction && trade && coupon.tradeRestriction !== trade) {
+      return res.status(400).json({
+        valid: false,
+        message: `الكوبون ده مخصص لخدمة تانية بس.`,
+      });
+    }
+    if (coupon.maxTotalUses != null && coupon.usedCount >= coupon.maxTotalUses) {
+      return res.status(400).json({ valid: false, message: 'الكوبون ده خلص الاستخدامات بتاعته.' });
+    }
+    if (coupon.usedByUserIds.includes(req.userId)) {
+      return res.status(400).json({ valid: false, message: 'أنت استخدمت الكوبون ده قبل كده.' });
+    }
+
+    res.json({
+      valid: true,
+      discountType: coupon.discountType,
+      discountValue: coupon.discountValue,
+      code: coupon.code,
+    });
+  } catch (err) {
+    res.status(500).json({ valid: false, message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+// ── الكوبونات النشطة (Public) ─────────────────────────────────
+// ⚠️ عام ومفيهوش verifyToken عمدًا — الهدف إن أي زائر يشوف العروض المتاحة
+// حتى قبل ما يسجل دخول (زي أي موقع تسوق عادي). بنرجّع بس الحقول اللي المستخدم
+// محتاجها (كود، نوع الخصم، القيمة، التخصص) وبنستبعد usedByUserIds/usedCount
+// عشان مفيش داعي يبانوا للعامة
+app.get('/coupons/active', (req, res) => {
+  const db = readDB();
+  const now = Date.now();
+
+  const activeCoupons = (db.coupons || [])
+    .filter((c) => {
+      if (!c.isActive) return false;
+      if (c.expiryDate && now > new Date(c.expiryDate).getTime()) return false;
+      if (c.maxTotalUses != null && c.usedCount >= c.maxTotalUses) return false;
+      return true;
+    })
+    .map((c) => ({
+      code: c.code,
+      discountType: c.discountType,
+      discountValue: c.discountValue,
+      tradeRestriction: c.tradeRestriction,
+    }));
+
+  res.json(activeCoupons);
+});
+
+
+// ── إنشاء حجز (مخصص، بيسبق الـ generic loop تحت) ─────────────
+// ⚠️ ده override لمسار POST /bookings العام — بيتسجل هنا قبل الـ collections.forEach
+// تحت، فبيشتغل هو بدل الـ handler العام (اللي كان بيعمل مجرد spread للـ body).
+// السبب: التطبيق الفعلي للخصم لازم يحصل في السيرفر مش الفرونت، وإلا أي حد يقدر
+// يزوّر discountAmount من عنده. الفرونت بيبعت totalAmount زي ما هو (السعر الأصلي
+// قبل الخصم، محسوب من hourlyRate × estimatedHours زي العادة) + couponCode لو موجود،
+// والسيرفر هو اللي بيحسب الخصم الحقيقي ويسجّل استخدام الكوبون.
+// ⚠️ verifyToken هنا مطلوب عشان نعرف مين المستخدم (req.userId) للتحقق من
+// "الكوبون ده استُخدم قبل كده من نفس الشخص ولا لأ" — ده كمان بالمرة بيقفل
+// جزء من الثغرة المعروفة إن /bookings كانت من غير حماية JWT خالص.
+app.post('/bookings', verifyToken, (req, res) => {
+  try {
+    const { couponCode, ...bookingData } = req.body;
+    const db = readDB();
+
+    const originalAmount = Number(bookingData.totalAmount) || 0;
+    let discountAmount = 0;
+    let appliedCouponCode = null;
+
+    if (couponCode) {
+      const coupon = (db.coupons || []).find(
+        (c) => c.code === String(couponCode).trim().toUpperCase()
+      );
+
+      if (!coupon) {
+        return res.status(400).json({ message: 'كود الكوبون ده مش موجود.' });
+      }
+      if (!coupon.isActive) {
+        return res.status(400).json({ message: 'الكوبون ده مش شغال دلوقتي.' });
+      }
+      if (coupon.expiryDate && Date.now() > new Date(coupon.expiryDate).getTime()) {
+        return res.status(400).json({ message: 'الكوبون ده منتهي الصلاحية.' });
+      }
+      if (
+        coupon.tradeRestriction &&
+        bookingData.trade &&
+        coupon.tradeRestriction !== bookingData.trade
+      ) {
+        return res.status(400).json({ message: 'الكوبون ده مخصص لخدمة تانية بس.' });
+      }
+      if (coupon.maxTotalUses != null && coupon.usedCount >= coupon.maxTotalUses) {
+        return res.status(400).json({ message: 'الكوبون ده خلص الاستخدامات بتاعته.' });
+      }
+      if (coupon.usedByUserIds.includes(req.userId)) {
+        return res.status(400).json({ message: 'أنت استخدمت الكوبون ده قبل كده.' });
+      }
+
+      discountAmount =
+        coupon.discountType === 'percentage'
+          ? (originalAmount * coupon.discountValue) / 100
+          : coupon.discountValue;
+      // مينفعش الخصم يعدي قيمة الحجز نفسها (يعني الحد الأدنى للسعر النهائي صفر)
+      discountAmount = Math.min(discountAmount, originalAmount);
+      appliedCouponCode = coupon.code;
+
+      // ⚠️ استهلاك الكوبون الفعلي بيحصل هنا بس — لحظة تأكيد الحجز
+      coupon.usedCount += 1;
+      coupon.usedByUserIds.push(req.userId);
+    }
+
+    const finalAmount = Math.round((originalAmount - discountAmount) * 100) / 100;
+
+    if (!db.bookings) db.bookings = [];
+    const newBooking = {
+      id: crypto.randomUUID(),
+      ...bookingData,
+      originalAmount,
+      discountAmount,
+      couponCode: appliedCouponCode,
+      totalAmount: finalAmount,
+    };
+    db.bookings.push(newBooking);
+    writeDB(db);
+
+    res.status(201).json(newBooking);
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+
 const collections = ['workers', 'bookings', 'reviews', 'messages', 'conversations', 'notifications'];
 const SPECIAL_QUERY_KEYS = ['_sort', '_order', '_limit', '_page'];
 
+// ⚠️⚠️ الفيكس الحرج: أي GET عام على /workers لازم يستثني أي صنايعي
+// الـ user المرتبط بيه status != 'active' — وإلا صنايعية pending/blocked/rejected
+// هيفضلوا ظاهرين للعملاء في find-services وكأن حسابهم متوافق عليه فعليًا
 collections.forEach((collection) => {
   app.get(`/${collection}`, (req, res) => {
     const db = readDB();
@@ -596,6 +849,8 @@ collections.forEach((collection) => {
   });
 });
 
+// ⚠️ نفس الفكرة على /workers/:id — وإلا حد يقدر يوصل لبروفايل صنايعي pending
+// مباشرة لو عرف رابط الـ id بتاعه (مثلاً لو حفظ اللينك قبل ما يتقبل)
 collections.forEach((collection) => {
   app.get(`/${collection}/:id`, (req, res) => {
     const db = readDB();
@@ -649,5 +904,4 @@ collections.forEach((collection) => {
 app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
 
 const port = process.env.PORT || 3000;
-// ⚠️ اتغيّر من app.listen لـ server.listen عشان socket.io يشتغل على نفس البورت
-server.listen(port, () => console.log(`Server running on port ${port}`));
+app.listen(port, () => console.log(`Server running on port ${port}`));
