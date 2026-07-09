@@ -7,6 +7,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
+const http = require('http');
+const { Server } = require('socket.io');
 const app = express();
 
 // ⚠️ Railway (وأي منصة استضافة بتحط السيرفر ورا proxy) بتبعت هيدر X-Forwarded-For
@@ -90,6 +92,41 @@ function sanitizeUser(user) {
   return safe;
 }
 
+// ============ WEBSOCKET (Socket.IO) ============
+// ⚠️ بنستخدم نفس الـ HTTP server بتاع Express (مش سيرفر منفصل)، عشان يشتغل
+// عادي على Railway من غير أي إعداد أو تكلفة إضافية — الاتصال بيمر على نفس
+// البورت والدومين بتاع الـ backend الحالي
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: ALLOWED_ORIGIN },
+});
+
+// أي اتصال socket لازم يبعت توكن أدمن صالح، وإلا بيترفض فورًا
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error('unauthorized'));
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.role !== 'admin') return next(new Error('forbidden'));
+    socket.userId = decoded.id;
+    next();
+  } catch {
+    next(new Error('unauthorized'));
+  }
+});
+
+io.on('connection', (socket) => {
+  // كل الأدمنز في room واحدة عشان نبعتلهم كلهم مع بعض بضربة واحدة
+  socket.join('admins');
+});
+
+// بتحسب عدد الـ pending الحقيقي من الـ DB وتبعته لكل الأدمنز المتصلين حاليًا
+function broadcastPendingApprovals() {
+  const db = readDB();
+  const pendingApprovals = (db.users || []).filter((u) => u.status === 'pending').length;
+  io.to('admins').emit('admin:pendingApprovalsChanged', { pendingApprovals });
+}
+
 // ============ EMAIL (Brevo HTTP API) ============
 // ⚠️ بنستخدم الـ HTTP API بدل SMTP عمدًا — كتير من منصات الاستضافة (زي Railway)
 // بتحجب أو بتقيّد بورتات SMTP التقليدية (587/465/25) كإجراء ضد الـ spam، فالاتصال
@@ -156,7 +193,7 @@ const forgotPasswordLimiter = rateLimit({
 
 app.post('/auth/register', registerLimiter, async (req, res) => {
   try {
-    const { email, password, fullName, role, nationalId, workerData } = req.body;
+    const { email, password, fullName, role, nationalId, mobileNumber, workerData } = req.body;
 
     if (!email || !password || !fullName || !role) {
       return res.status(400).json({ message: 'بيانات ناقصة.' });
@@ -172,6 +209,9 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     }
     if (!nationalId || !/^\d{14}$/.test(nationalId)) {
       return res.status(400).json({ message: 'الرقم القومي لازم يكون 14 رقم صحيح.' });
+    }
+    if (!mobileNumber || !/^01[0125]\d{8}$/.test(mobileNumber)) {
+      return res.status(400).json({ message: 'رقم الموبايل غير صحيح.' });
     }
 
     const db = readDB();
@@ -194,6 +234,7 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
       fullName,
       role,
       nationalId,
+      mobileNumber,
       status: 'pending',
       createdAt: new Date().toISOString(),
     };
@@ -223,6 +264,9 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     db.users.push(newUser);
     if (newWorker) db.workers.push(newWorker);
     writeDB(db);
+
+    // ⚠️ حساب جديد اتعمل بحالة pending → نبلّغ كل الأدمنز المتصلين فورًا
+    broadcastPendingApprovals();
 
     const docsUploadToken = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, {
       expiresIn: '15m',
@@ -503,6 +547,10 @@ app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   }
 
   writeDB(db);
+
+  // ⚠️ الحالة اتغيّرت (قبول/رفض/حظر) → نحدّث كل الأدمنز المتصلين بالرقم الحقيقي
+  broadcastPendingApprovals();
+
   res.json(sanitizeUser(user));
 });
 
@@ -806,6 +854,40 @@ app.post('/bookings', verifyToken, (req, res) => {
   }
 });
 
+// ── رقم تلفون العميل/الصنايعي بتاعين حجز معين ────────────────
+// ⚠️ ده الـ endpoint المحمي اللي بيسمح برقم التلفون يظهر — بس في سياق حجز
+// حقيقي، وبس للطرفين المعنيين بيه (العميل صاحب الحجز، أو الصنايعي المحجوز).
+// مش بيتضاف على Worker/User العامين خالص، فمفيش أي تسريب لأي زائر عادي
+// بيتصفح find-services أو specialist-profile
+app.get('/bookings/:id/contact', verifyToken, (req, res) => {
+  try {
+    const db = readDB();
+    const booking = (db.bookings || []).find((b) => b.id === req.params.id);
+    if (!booking) return res.status(404).json({ message: 'الحجز ده مش موجود.' });
+
+    const worker = (db.workers || []).find((w) => w.id === booking.workerId);
+    const workerUserId = worker?.userId ?? null;
+
+    // ⚠️ التحقق الأمني الأساسي: لازم اللي بيطلب يكون إما العميل صاحب الحجز
+    // ده بالظبط، أو الصنايعي المحجوز بالظبط — مش أي مستخدم مسجل دخول عادي
+    const isClient = req.userId === booking.clientId;
+    const isWorker = workerUserId && req.userId === workerUserId;
+    if (!isClient && !isWorker) {
+      return res.status(403).json({ message: 'مش مسموحلك تشوف بيانات التواصل دي.' });
+    }
+
+    const clientUser = (db.users || []).find((u) => u.id === booking.clientId);
+    const workerUser = workerUserId ? (db.users || []).find((u) => u.id === workerUserId) : null;
+
+    res.json({
+      clientPhone: clientUser?.mobileNumber ?? null,
+      workerPhone: workerUser?.mobileNumber ?? null,
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
 
 const collections = ['workers', 'bookings', 'reviews', 'messages', 'conversations', 'notifications'];
 const SPECIAL_QUERY_KEYS = ['_sort', '_order', '_limit', '_page'];
@@ -901,7 +983,8 @@ collections.forEach((collection) => {
   });
 });
 
-app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
+app.get('/', (req, res) => res.send('Sanaye3i Backend is Running '));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+// ⚠️ server.listen مش app.listen — عشان socket.io يشتغل على نفس البورت
+server.listen(port, () => console.log(`Server running on port ${port}`));
