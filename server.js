@@ -11,11 +11,6 @@ const http = require('http');
 const { Server } = require('socket.io');
 const app = express();
 
-// ⚠️ Railway (وأي منصة استضافة بتحط السيرفر ورا proxy) بتبعت هيدر X-Forwarded-For
-// عشان توضح الـ IP الحقيقي بتاع الزائر. من غير السطر ده، express-rate-limit
-// مش هيوثق في الهيدر ده، وده ممكن يخلي الـ rate limiting (على login/register/
-// forgot-password) يشتغل غلط. الرقم 1 معناه "وثّق في أول proxy واحد بس"
-// (وده بالظبط عدد الـ proxies اللي Railway بيحط سيرفرك وراهم)
 app.set('trust proxy', 1);
 
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:4200';
@@ -92,10 +87,6 @@ function sanitizeUser(user) {
   return safe;
 }
 
-// ============ WEBSOCKET (Socket.IO) ============
-// ⚠️ بنستخدم نفس الـ HTTP server بتاع Express (مش سيرفر منفصل)، عشان يشتغل
-// عادي على Railway من غير أي إعداد أو تكلفة إضافية — الاتصال بيمر على نفس
-// البورت والدومين بتاع الـ backend الحالي
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: ALLOWED_ORIGIN },
@@ -127,12 +118,6 @@ function broadcastPendingApprovals() {
   io.to('admins').emit('admin:pendingApprovalsChanged', { pendingApprovals });
 }
 
-// ============ EMAIL (Brevo HTTP API) ============
-// ⚠️ بنستخدم الـ HTTP API بدل SMTP عمدًا — كتير من منصات الاستضافة (زي Railway)
-// بتحجب أو بتقيّد بورتات SMTP التقليدية (587/465/25) كإجراء ضد الـ spam، فالاتصال
-// بيعمل timeout. الـ API بيشتغل عن طريق HTTPS العادي (بورت 443) اللي مش محجوب أبدًا.
-// ⚠️ متغيرات البيئة المطلوبة على Railway:
-// BREVO_API_KEY, BREVO_SENDER_EMAIL
 async function sendResetPasswordEmail(toEmail, fullName, resetLink) {
   const response = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
@@ -162,6 +147,39 @@ async function sendResetPasswordEmail(toEmail, fullName, resetLink) {
   if (!response.ok) {
     const errorBody = await response.text();
     throw new Error(`Brevo API error (${response.status}): ${errorBody}`);
+  }
+}
+
+async function sendAdminNotificationEmail(subject, htmlContent) {
+  try {
+    const db = readDB();
+    const adminEmails = (db.users || [])
+      .filter((u) => u.role === 'admin' && u.email)
+      .map((u) => u.email);
+
+    if (adminEmails.length === 0) return;
+
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'api-key': process.env.BREVO_API_KEY,
+      },
+      body: JSON.stringify({
+        sender: { name: 'صنايعي', email: process.env.BREVO_SENDER_EMAIL },
+        to: adminEmails.map((email) => ({ email })),
+        subject,
+        htmlContent,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`Admin notification email failed (${response.status}):`, errorBody);
+    }
+  } catch (err) {
+    console.error('Failed to send admin notification email:', err);
   }
 }
 
@@ -258,6 +276,9 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
         completedJobs: 0,
         bio: workerData.bio ?? '',
         avatarColor: workerData.avatarColor ?? '#2563EB',
+        // ⚠️ جديد: مهارات حقيقية بيختارها الصنايعي وقت التسجيل، Array.isArray
+        // بتحمينا لو الفرونت بعت حاجة غلط عن طريق الخطأ (مش array)
+        skills: Array.isArray(workerData.skills) ? workerData.skills : [],
       };
     }
 
@@ -267,6 +288,23 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
 
     // ⚠️ حساب جديد اتعمل بحالة pending → نبلّغ كل الأدمنز المتصلين فورًا
     broadcastPendingApprovals();
+
+    // ⚠️ إشعار بالإيميل كمان — بيوصل حتى لو الأدمن مش فاتح الداشبورد دلوقتي
+    // (fire-and-forget، مش بننتظره عشان استجابة التسجيل تفضل سريعة)
+    sendAdminNotificationEmail(
+      'طلب تسجيل جديد - صنايعي',
+      `
+      <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
+        <h2 style="color: #2563EB;">طلب تسجيل جديد</h2>
+        <p><strong>${fullName}</strong> سجّل حساب جديد كـ ${role === 'pro' ? 'صنايعي' : 'عميل'}${role === 'pro' && newWorker ? ` (${newWorker.tradeLabel})` : ''
+      }.</p>
+        <p>ادخل لوحة التحكم عشان تراجع الطلب وتوافق عليه أو ترفضه.</p>
+        <a href="${ALLOWED_ORIGIN}/admin/registrations" style="display:inline-block; background:#2563EB; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
+          مراجعة الطلب
+        </a>
+      </div>
+      `
+    );
 
     const docsUploadToken = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, {
       expiresIn: '15m',
@@ -584,16 +622,36 @@ app.post('/admin/bootstrap', async (req, res) => {
   res.status(201).json({ message: 'اتعمل الأدمن بنجاح.' });
 });
 
-// ============ COUPONS (كوبونات الخصم) ============
-// ⚠️ القرارات المتفق عليها:
-// - نوع الخصم: نسبة مئوية أو مبلغ ثابت (الأدمن يختار وقت الإنشاء)
-// - حدود الاستخدام: حد إجمالي (maxTotalUses) + مرة واحدة لكل مستخدم (usedByUserIds)
-// - النطاق: ممكن يتخصص لتصنيف معين (tradeRestriction) أو يفضل عام (null)
-//
-// ⚠️ مهم: الـ endpoints دي بتدير الكوبون وبتتحقق منه بس (validate) — الاستهلاك
-// الفعلي (تسجيل الاستخدام + خصم السعر الحقيقي) بيحصل وقت إنشاء الحجز، وده
-// لسه معلّق لحد ما تجيلي ملفات الـ Booking model و bookings.service.ts وكومبوننت
-// "Review & Confirm" (شوف الملف المرجعي).
+// ── تعديل إيميل الأدمن نفسه (مش أي حساب تاني) ──────────────────
+// ⚠️ verifyAdmin بيتأكد إن اللي بيطلب ده أدمن فعلاً، وبنستخدم req.userId
+// (جاي من التوكن، مش من الـ body) عشان نضمن إنه بيعدّل حسابه هو بس —
+// ده الفرق الأمني الأساسي عن أي endpoint "تعديل يوزر تاني"
+app.patch('/admin/me', verifyAdmin, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ message: 'إيميل غير صالح.' });
+    }
+
+    const db = readDB();
+
+    const emailTaken = db.users.find((u) => u.email === email && u.id !== req.userId);
+    if (emailTaken) {
+      return res.status(409).json({ message: 'الإيميل ده مستخدم بالفعل بحساب تاني.' });
+    }
+
+    const admin = db.users.find((u) => u.id === req.userId);
+    if (!admin) return res.status(404).json({ message: 'الحساب مش موجود.' });
+
+    admin.email = email;
+    writeDB(db);
+
+    res.json(sanitizeUser(admin));
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
 
 function generateCouponCode() {
   // كود من 8 حروف/أرقام، سهل القراءة (من غير حروف بتتلخبط زي 0/O أو 1/I)
@@ -671,8 +729,6 @@ app.patch('/admin/coupons/:id', verifyAdmin, (req, res) => {
   const coupon = (db.coupons || []).find((c) => c.id === req.params.id);
   if (!coupon) return res.status(404).json({ message: 'مش لاقي الكوبون ده.' });
 
-  // ⚠️ بنسمح بتعديل الحقول دي بس — مش بنسمح تتعدل usedCount/usedByUserIds
-  // يدويًا من هنا عشان محدش يلخبط أرقام الاستخدام الحقيقية
   const allowedFields = [
     'discountType',
     'discountValue',
@@ -698,10 +754,6 @@ app.delete('/admin/coupons/:id', verifyAdmin, (req, res) => {
   res.json({ success: true });
 });
 
-// ── التحقق من كوبون (مش استهلاك) ─────────────────────────────
-// ⚠️ ده بيتنادى من خطوة "Review & Confirm" وقت ما المستخدم يكتب كود الكوبون،
-// عشان نوريله الخصم قبل ما يأكد الحجز فعليًا. الاستهلاك الحقيقي (تسجيل
-// usedCount + إضافة userId في usedByUserIds) بيحصل بس وقت تأكيد الحجز النهائي
 app.post('/coupons/validate', verifyToken, (req, res) => {
   try {
     const { code, trade } = req.body;
@@ -747,11 +799,6 @@ app.post('/coupons/validate', verifyToken, (req, res) => {
   }
 });
 
-// ── الكوبونات النشطة (Public) ─────────────────────────────────
-// ⚠️ عام ومفيهوش verifyToken عمدًا — الهدف إن أي زائر يشوف العروض المتاحة
-// حتى قبل ما يسجل دخول (زي أي موقع تسوق عادي). بنرجّع بس الحقول اللي المستخدم
-// محتاجها (كود، نوع الخصم، القيمة، التخصص) وبنستبعد usedByUserIds/usedCount
-// عشان مفيش داعي يبانوا للعامة
 app.get('/coupons/active', (req, res) => {
   const db = readDB();
   const now = Date.now();
@@ -774,16 +821,6 @@ app.get('/coupons/active', (req, res) => {
 });
 
 
-// ── إنشاء حجز (مخصص، بيسبق الـ generic loop تحت) ─────────────
-// ⚠️ ده override لمسار POST /bookings العام — بيتسجل هنا قبل الـ collections.forEach
-// تحت، فبيشتغل هو بدل الـ handler العام (اللي كان بيعمل مجرد spread للـ body).
-// السبب: التطبيق الفعلي للخصم لازم يحصل في السيرفر مش الفرونت، وإلا أي حد يقدر
-// يزوّر discountAmount من عنده. الفرونت بيبعت totalAmount زي ما هو (السعر الأصلي
-// قبل الخصم، محسوب من hourlyRate × estimatedHours زي العادة) + couponCode لو موجود،
-// والسيرفر هو اللي بيحسب الخصم الحقيقي ويسجّل استخدام الكوبون.
-// ⚠️ verifyToken هنا مطلوب عشان نعرف مين المستخدم (req.userId) للتحقق من
-// "الكوبون ده استُخدم قبل كده من نفس الشخص ولا لأ" — ده كمان بالمرة بيقفل
-// جزء من الثغرة المعروفة إن /bookings كانت من غير حماية JWT خالص.
 app.post('/bookings', verifyToken, (req, res) => {
   try {
     const { couponCode, ...bookingData } = req.body;
@@ -825,11 +862,9 @@ app.post('/bookings', verifyToken, (req, res) => {
         coupon.discountType === 'percentage'
           ? (originalAmount * coupon.discountValue) / 100
           : coupon.discountValue;
-      // مينفعش الخصم يعدي قيمة الحجز نفسها (يعني الحد الأدنى للسعر النهائي صفر)
       discountAmount = Math.min(discountAmount, originalAmount);
       appliedCouponCode = coupon.code;
 
-      // ⚠️ استهلاك الكوبون الفعلي بيحصل هنا بس — لحظة تأكيد الحجز
       coupon.usedCount += 1;
       coupon.usedByUserIds.push(req.userId);
     }
@@ -848,17 +883,28 @@ app.post('/bookings', verifyToken, (req, res) => {
     db.bookings.push(newBooking);
     writeDB(db);
 
+    sendAdminNotificationEmail(
+      'حجز جديد - صنايعي',
+      `
+      <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
+        <h2 style="color: #2563EB;">حجز جديد</h2>
+        <p><strong>${newBooking.clientName}</strong> حجز <strong>${newBooking.workerName}</strong>
+          (${newBooking.workerTrade}).</p>
+        <p>القيمة: ${newBooking.totalAmount} ج.م${newBooking.couponCode ? ` (بعد خصم كوبون "${newBooking.couponCode}")` : ''
+      }</p>
+        <a href="${ALLOWED_ORIGIN}/admin/bookings" style="display:inline-block; background:#2563EB; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
+          شوف الحجوزات
+        </a>
+      </div>
+      `
+    );
+
     res.status(201).json(newBooking);
   } catch (err) {
     res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
   }
 });
 
-// ── رقم تلفون العميل/الصنايعي بتاعين حجز معين ────────────────
-// ⚠️ ده الـ endpoint المحمي اللي بيسمح برقم التلفون يظهر — بس في سياق حجز
-// حقيقي، وبس للطرفين المعنيين بيه (العميل صاحب الحجز، أو الصنايعي المحجوز).
-// مش بيتضاف على Worker/User العامين خالص، فمفيش أي تسريب لأي زائر عادي
-// بيتصفح find-services أو specialist-profile
 app.get('/bookings/:id/contact', verifyToken, (req, res) => {
   try {
     const db = readDB();
@@ -930,7 +976,6 @@ collections.forEach((collection) => {
     res.json(items);
   });
 });
-
 // ⚠️ نفس الفكرة على /workers/:id — وإلا حد يقدر يوصل لبروفايل صنايعي pending
 // مباشرة لو عرف رابط الـ id بتاعه (مثلاً لو حفظ اللينك قبل ما يتقبل)
 collections.forEach((collection) => {
@@ -983,7 +1028,7 @@ collections.forEach((collection) => {
   });
 });
 
-app.get('/', (req, res) => res.send('Sanaye3i Backend is Running '));
+app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
 
 const port = process.env.PORT || 3000;
 // ⚠️ server.listen مش app.listen — عشان socket.io يشتغل على نفس البورت
