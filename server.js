@@ -41,8 +41,6 @@ function ensureNotificationsCollection() {
 }
 ensureNotificationsCollection();
 
-// ⚠️ كوليكشن الكوبونات الجديدة — لو قاعدة البيانات عندك اتعملت قبل كده
-// ومفيهاش coupons، بنضيفها هنا أول مرة السيرفر يشتغل
 function ensureCouponsCollection() {
   const db = readDB();
   if (!db.coupons) {
@@ -51,6 +49,15 @@ function ensureCouponsCollection() {
   }
 }
 ensureCouponsCollection();
+
+function ensureAdminLogsCollection() {
+  const db = readDB();
+  if (!db.adminLogs) {
+    db.adminLogs = [];
+    writeDB(db);
+  }
+}
+ensureAdminLogsCollection();
 
 const UPLOADS_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/uploads`
@@ -87,12 +94,41 @@ function sanitizeUser(user) {
   return safe;
 }
 
+// ============ ADMIN AUDIT LOG ============
+function logAdminAction(req, action, targetType, targetId, details) {
+  try {
+    const db = readDB();
+    if (!db.adminLogs) db.adminLogs = [];
+
+    const admin = (db.users || []).find((u) => u.id === req.userId);
+
+    db.adminLogs.unshift({
+      id: crypto.randomUUID(),
+      adminId: req.userId,
+      adminName: admin?.fullName ?? null,
+      action,
+      targetType,
+      targetId,
+      details: details ?? null,
+      createdAt: new Date().toISOString(),
+    });
+
+    if (db.adminLogs.length > 500) {
+      db.adminLogs = db.adminLogs.slice(0, 500);
+    }
+
+    writeDB(db);
+  } catch (err) {
+    console.error('Failed to write admin log:', err);
+  }
+}
+
+// ============ WEBSOCKET (Socket.IO) ============
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: ALLOWED_ORIGIN },
 });
 
-// أي اتصال socket لازم يبعت توكن أدمن صالح، وإلا بيترفض فورًا
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
   if (!token) return next(new Error('unauthorized'));
@@ -107,17 +143,16 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-  // كل الأدمنز في room واحدة عشان نبعتلهم كلهم مع بعض بضربة واحدة
   socket.join('admins');
 });
 
-// بتحسب عدد الـ pending الحقيقي من الـ DB وتبعته لكل الأدمنز المتصلين حاليًا
 function broadcastPendingApprovals() {
   const db = readDB();
   const pendingApprovals = (db.users || []).filter((u) => u.status === 'pending').length;
   io.to('admins').emit('admin:pendingApprovalsChanged', { pendingApprovals });
 }
 
+// ============ EMAIL (Brevo HTTP API) ============
 async function sendResetPasswordEmail(toEmail, fullName, resetLink) {
   const response = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
@@ -271,13 +306,10 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
         serviceRadius: Number(workerData.serviceRadius) || 15,
         rating: 0,
         reviewsCount: 0,
-        // ⚠️ false من الأول — هتتفعّل تلقائي لما الأدمن يوافق (شوف /admin/users/:id/status تحت)
         isAvailable: false,
         completedJobs: 0,
         bio: workerData.bio ?? '',
         avatarColor: workerData.avatarColor ?? '#2563EB',
-        // ⚠️ جديد: مهارات حقيقية بيختارها الصنايعي وقت التسجيل، Array.isArray
-        // بتحمينا لو الفرونت بعت حاجة غلط عن طريق الخطأ (مش array)
         skills: Array.isArray(workerData.skills) ? workerData.skills : [],
       };
     }
@@ -286,17 +318,15 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     if (newWorker) db.workers.push(newWorker);
     writeDB(db);
 
-    // ⚠️ حساب جديد اتعمل بحالة pending → نبلّغ كل الأدمنز المتصلين فورًا
     broadcastPendingApprovals();
 
-    // ⚠️ إشعار بالإيميل كمان — بيوصل حتى لو الأدمن مش فاتح الداشبورد دلوقتي
-    // (fire-and-forget، مش بننتظره عشان استجابة التسجيل تفضل سريعة)
     sendAdminNotificationEmail(
       'طلب تسجيل جديد - صنايعي',
       `
       <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
         <h2 style="color: #2563EB;">طلب تسجيل جديد</h2>
-        <p><strong>${fullName}</strong> سجّل حساب جديد كـ ${role === 'pro' ? 'صنايعي' : 'عميل'}${role === 'pro' && newWorker ? ` (${newWorker.tradeLabel})` : ''
+        <p><strong>${fullName}</strong> سجّل حساب جديد كـ ${role === 'pro' ? 'صنايعي' : 'عميل'}${
+        role === 'pro' && newWorker ? ` (${newWorker.tradeLabel})` : ''
       }.</p>
         <p>ادخل لوحة التحكم عشان تراجع الطلب وتوافق عليه أو ترفضه.</p>
         <a href="${ALLOWED_ORIGIN}/admin/registrations" style="display:inline-block; background:#2563EB; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
@@ -369,8 +399,6 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
     const db = readDB();
     const user = db.users.find((u) => u.email === email);
 
-    // ⚠️ رد عام بغض النظر لو الإيميل موجود ولا لأ — عشان محدش يقدر يتأكد
-    // مين مسجل عندنا من غيره (نفس المبدأ اللي بنتبعه في register أصلاً)
     const genericResponse = {
       message: 'لو البريد الإلكتروني ده مسجل عندنا، هيوصلك لينك لإعادة تعيين كلمة المرور.',
     };
@@ -379,13 +407,11 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
       return res.json(genericResponse);
     }
 
-    // توكن عشوائي طويل، بنبعت الـ raw token في الإيميل وبنخزن نسخة hashed بس
-    // (زي الباسورد بالظبط) — عشان لو حد وصل لـ db.json مايقدرش يستخدم التوكنات المخزنة
     const rawToken = crypto.randomBytes(32).toString('hex');
     const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
 
     user.resetPasswordToken = hashedToken;
-    user.resetPasswordExpiry = Date.now() + 60 * 60 * 1000; // ساعة واحدة
+    user.resetPasswordExpiry = Date.now() + 60 * 60 * 1000;
     writeDB(db);
 
     const resetLink = `${ALLOWED_ORIGIN}/reset-password?token=${rawToken}&email=${encodeURIComponent(email)}`;
@@ -393,8 +419,6 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
     try {
       await sendResetPasswordEmail(email, user.fullName, resetLink);
     } catch (emailErr) {
-      // لو فشل إرسال الإيميل، منسيبش المستخدم يعرف (عشان مانكشفش وجود الحساب) —
-      // بس بنلوج الخطأ عندنا عشان نلاحظه
       console.error('Failed to send reset email:', emailErr);
     }
 
@@ -435,7 +459,6 @@ app.post('/auth/reset-password', async (req, res) => {
     }
 
     user.password = await bcrypt.hash(newPassword, 10);
-    // التوكن بيتحرق بعد الاستخدام — نفس فكرة الـ single-use
     delete user.resetPasswordToken;
     delete user.resetPasswordExpiry;
     writeDB(db);
@@ -531,6 +554,12 @@ app.get('/admin/stats', verifyAdmin, (req, res) => {
   });
 });
 
+app.get('/admin/logs', verifyAdmin, (req, res) => {
+  const db = readDB();
+  const limit = req.query.limit ? Number(req.query.limit) : 100;
+  res.json((db.adminLogs || []).slice(0, limit));
+});
+
 app.get('/admin/users', verifyAdmin, (req, res) => {
   const db = readDB();
   let users = db.users || [];
@@ -562,8 +591,6 @@ app.get('/admin/users/:id', verifyAdmin, (req, res) => {
   res.json({ user: sanitizeUser(user), worker });
 });
 
-// تغيير حالة مستخدم — accept / reject / block / unblock
-// ⚠️ لو صنايعي، بنزامن worker.isAvailable مع الحالة الجديدة تلقائيًا
 app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   const { status } = req.body;
   const validStatuses = ['pending', 'active', 'rejected', 'blocked'];
@@ -575,6 +602,7 @@ app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   const user = (db.users || []).find((u) => u.id === req.params.id);
   if (!user) return res.status(404).json({ message: 'مش لاقي المستخدم ده.' });
 
+  const previousStatus = user.status;
   user.status = status;
 
   if (user.role === 'pro') {
@@ -586,7 +614,12 @@ app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
 
   writeDB(db);
 
-  // ⚠️ الحالة اتغيّرت (قبول/رفض/حظر) → نحدّث كل الأدمنز المتصلين بالرقم الحقيقي
+  logAdminAction(req, 'user_status_changed', 'user', user.id, {
+    targetName: user.fullName,
+    from: previousStatus,
+    to: status,
+  });
+
   broadcastPendingApprovals();
 
   res.json(sanitizeUser(user));
@@ -622,10 +655,6 @@ app.post('/admin/bootstrap', async (req, res) => {
   res.status(201).json({ message: 'اتعمل الأدمن بنجاح.' });
 });
 
-// ── تعديل إيميل الأدمن نفسه (مش أي حساب تاني) ──────────────────
-// ⚠️ verifyAdmin بيتأكد إن اللي بيطلب ده أدمن فعلاً، وبنستخدم req.userId
-// (جاي من التوكن، مش من الـ body) عشان نضمن إنه بيعدّل حسابه هو بس —
-// ده الفرق الأمني الأساسي عن أي endpoint "تعديل يوزر تاني"
 app.patch('/admin/me', verifyAdmin, async (req, res) => {
   try {
     const { email } = req.body;
@@ -643,8 +672,14 @@ app.patch('/admin/me', verifyAdmin, async (req, res) => {
     const admin = db.users.find((u) => u.id === req.userId);
     if (!admin) return res.status(404).json({ message: 'الحساب مش موجود.' });
 
+    const previousEmail = admin.email;
     admin.email = email;
     writeDB(db);
+
+    logAdminAction(req, 'admin_email_changed', 'admin', admin.id, {
+      from: previousEmail,
+      to: email,
+    });
 
     res.json(sanitizeUser(admin));
   } catch (err) {
@@ -652,9 +687,9 @@ app.patch('/admin/me', verifyAdmin, async (req, res) => {
   }
 });
 
+// ============ COUPONS ============
 
 function generateCouponCode() {
-  // كود من 8 حروف/أرقام، سهل القراءة (من غير حروف بتتلخبط زي 0/O أو 1/I)
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
   for (let i = 0; i < 8; i++) {
@@ -662,8 +697,6 @@ function generateCouponCode() {
   }
   return code;
 }
-
-// ── إدارة الكوبونات (أدمن بس) ──────────────────────────────
 
 app.get('/admin/coupons', verifyAdmin, (req, res) => {
   const db = readDB();
@@ -676,9 +709,9 @@ app.post('/admin/coupons', verifyAdmin, (req, res) => {
       code,
       discountType,
       discountValue,
-      tradeRestriction, // TradeType أو null (يعني عام على كل التصنيفات)
-      maxTotalUses,     // رقم أو null (يعني مفيش حد إجمالي)
-      expiryDate,       // ISO date string أو null (يعني مفيش تاريخ انتهاء)
+      tradeRestriction,
+      maxTotalUses,
+      expiryDate,
     } = req.body;
 
     if (!discountType || !['percentage', 'fixed'].includes(discountType)) {
@@ -694,7 +727,6 @@ app.post('/admin/coupons', verifyAdmin, (req, res) => {
     const db = readDB();
     if (!db.coupons) db.coupons = [];
 
-    // لو الأدمن مبعتش كود، بنولّده تلقائي؛ لو بعت واحد بنوحده uppercase ونتأكد إنه فريد
     const finalCode = (code ? String(code).trim().toUpperCase() : generateCouponCode());
 
     const codeExists = db.coupons.find((c) => c.code === finalCode);
@@ -718,6 +750,13 @@ app.post('/admin/coupons', verifyAdmin, (req, res) => {
 
     db.coupons.push(newCoupon);
     writeDB(db);
+
+    logAdminAction(req, 'coupon_created', 'coupon', newCoupon.id, {
+      code: newCoupon.code,
+      discountType: newCoupon.discountType,
+      discountValue: newCoupon.discountValue,
+    });
+
     res.status(201).json(newCoupon);
   } catch (err) {
     res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
@@ -744,13 +783,25 @@ app.patch('/admin/coupons/:id', verifyAdmin, (req, res) => {
   }
 
   writeDB(db);
+
+  logAdminAction(req, 'coupon_updated', 'coupon', coupon.id, {
+    code: coupon.code,
+    changes: req.body,
+  });
+
   res.json(coupon);
 });
 
 app.delete('/admin/coupons/:id', verifyAdmin, (req, res) => {
   const db = readDB();
+  const coupon = (db.coupons || []).find((c) => c.id === req.params.id);
   db.coupons = (db.coupons || []).filter((c) => c.id !== req.params.id);
   writeDB(db);
+
+  if (coupon) {
+    logAdminAction(req, 'coupon_deleted', 'coupon', req.params.id, { code: coupon.code });
+  }
+
   res.json({ success: true });
 });
 
@@ -820,7 +871,83 @@ app.get('/coupons/active', (req, res) => {
   res.json(activeCoupons);
 });
 
+// ============ PUBLIC STATS ============
+let publicStatsCache = null;
+let publicStatsCacheAt = 0;
+const PUBLIC_STATS_TTL_MS = 15 * 60 * 1000;
 
+function computePublicStats() {
+  const db = readDB();
+  const users = db.users || [];
+  const workers = db.workers || [];
+  const bookings = db.bookings || [];
+  const reviews = db.reviews || [];
+
+  const activeUserIds = new Set(users.filter((u) => u.status === 'active').map((u) => u.id));
+
+  const approvedWorkers = workers.filter((w) => activeUserIds.has(w.userId));
+  const totalWorkers = approvedWorkers.length;
+  const activeWorkersNow = approvedWorkers.filter((w) => w.isAvailable).length;
+
+  const totalClients = users.filter((u) => u.role === 'client' && u.status === 'active').length;
+
+  const completedBookings = bookings.filter((b) => b.status === 'completed');
+  const completedJobs = completedBookings.length;
+
+  const avgRating =
+    reviews.length > 0
+      ? Math.round(
+          (reviews.reduce((sum, r) => sum + (Number(r.rating) || 0), 0) / reviews.length) * 10
+        ) / 10
+      : 0;
+
+  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const recentCompletedRevenue = completedBookings
+    .filter((b) => b.scheduledAt && now - new Date(b.scheduledAt).getTime() <= THIRTY_DAYS_MS)
+    .reduce((sum, b) => sum + (Number(b.totalAmount) || 0), 0);
+  const avgMonthlyIncome = totalWorkers > 0 ? Math.round(recentCompletedRevenue / totalWorkers) : 0;
+
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+  const clientsThisWeek = new Set(
+    bookings
+      .filter((b) => b.createdAt && now - new Date(b.createdAt).getTime() <= SEVEN_DAYS_MS)
+      .map((b) => b.clientId)
+  ).size;
+
+  const workersByTrade = {};
+  approvedWorkers.forEach((w) => {
+    const trade = w.trade || 'other';
+    workersByTrade[trade] = (workersByTrade[trade] || 0) + 1;
+  });
+
+  return {
+    totalWorkers,
+    activeWorkersNow,
+    totalClients,
+    completedJobs,
+    avgRating,
+    avgMonthlyIncome,
+    clientsThisWeek,
+    workersByTrade,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+app.get('/stats/public', (req, res) => {
+  try {
+    const now = Date.now();
+    if (!publicStatsCache || now - publicStatsCacheAt > PUBLIC_STATS_TTL_MS) {
+      publicStatsCache = computePublicStats();
+      publicStatsCacheAt = now;
+    }
+    res.json(publicStatsCache);
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+// ── إنشاء حجز (مخصص، بيسبق أي هاندلر تاني على /bookings) ─────────────
 app.post('/bookings', verifyToken, (req, res) => {
   try {
     const { couponCode, ...bookingData } = req.body;
@@ -875,6 +1002,10 @@ app.post('/bookings', verifyToken, (req, res) => {
     const newBooking = {
       id: crypto.randomUUID(),
       ...bookingData,
+      // ⚠️ لازم يكون العميل صاحب الحساب اللي بعت الطلب ده — مش أي clientId
+      // اتبعت في الـ body، وإلا حد يقدر يعمل حجز باسم عميل تاني
+      clientId: req.userId,
+      workStage: null,
       originalAmount,
       discountAmount,
       couponCode: appliedCouponCode,
@@ -890,7 +1021,8 @@ app.post('/bookings', verifyToken, (req, res) => {
         <h2 style="color: #2563EB;">حجز جديد</h2>
         <p><strong>${newBooking.clientName}</strong> حجز <strong>${newBooking.workerName}</strong>
           (${newBooking.workerTrade}).</p>
-        <p>القيمة: ${newBooking.totalAmount} ج.م${newBooking.couponCode ? ` (بعد خصم كوبون "${newBooking.couponCode}")` : ''
+        <p>القيمة: ${newBooking.totalAmount} ج.م${
+        newBooking.couponCode ? ` (بعد خصم كوبون "${newBooking.couponCode}")` : ''
       }</p>
         <a href="${ALLOWED_ORIGIN}/admin/bookings" style="display:inline-block; background:#2563EB; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
           شوف الحجوزات
@@ -905,6 +1037,7 @@ app.post('/bookings', verifyToken, (req, res) => {
   }
 });
 
+// ── رقم تلفون العميل/الصنايعي بتاعين حجز معين ────────────────
 app.get('/bookings/:id/contact', verifyToken, (req, res) => {
   try {
     const db = readDB();
@@ -914,8 +1047,6 @@ app.get('/bookings/:id/contact', verifyToken, (req, res) => {
     const worker = (db.workers || []).find((w) => w.id === booking.workerId);
     const workerUserId = worker?.userId ?? null;
 
-    // ⚠️ التحقق الأمني الأساسي: لازم اللي بيطلب يكون إما العميل صاحب الحجز
-    // ده بالظبط، أو الصنايعي المحجوز بالظبط — مش أي مستخدم مسجل دخول عادي
     const isClient = req.userId === booking.clientId;
     const isWorker = workerUserId && req.userId === workerUserId;
     if (!isClient && !isWorker) {
@@ -934,102 +1065,544 @@ app.get('/bookings/:id/contact', verifyToken, (req, res) => {
   }
 });
 
+// ── تحديث مرحلة الشغل (في الطريق / بدأ الشغل / خلّص) ─────────
+const VALID_WORK_STAGES = ['on_the_way', 'in_progress', 'done'];
 
-const collections = ['workers', 'bookings', 'reviews', 'messages', 'conversations', 'notifications'];
+app.patch('/bookings/:id/work-stage', verifyToken, (req, res) => {
+  try {
+    const { workStage } = req.body;
+    if (!VALID_WORK_STAGES.includes(workStage)) {
+      return res.status(400).json({ message: 'مرحلة الشغل المطلوبة مش صحيحة.' });
+    }
+
+    const db = readDB();
+    const booking = (db.bookings || []).find((b) => b.id === req.params.id);
+    if (!booking) return res.status(404).json({ message: 'الحجز ده مش موجود.' });
+
+    const worker = (db.workers || []).find((w) => w.id === booking.workerId);
+    if (!worker || worker.userId !== req.userId) {
+      return res.status(403).json({ message: 'مش مسموحلك تعدّل الحجز ده.' });
+    }
+
+    if (booking.status !== 'active') {
+      return res.status(400).json({ message: 'الطلب ده مش شغل جاري دلوقتي.' });
+    }
+
+    booking.workStage = workStage;
+    writeDB(db);
+
+    res.json(booking);
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+// ── رد الصنايعي على تقييم ─────────────────────────────────
+app.patch('/reviews/:id/reply', verifyToken, (req, res) => {
+  try {
+    const { reply } = req.body;
+    if (!reply || !String(reply).trim()) {
+      return res.status(400).json({ message: 'اكتب رد الأول.' });
+    }
+    if (String(reply).trim().length > 500) {
+      return res.status(400).json({ message: 'الرد طويل أوي، حاول تختصره.' });
+    }
+
+    const db = readDB();
+    const review = (db.reviews || []).find((r) => r.id === req.params.id);
+    if (!review) return res.status(404).json({ message: 'التقييم ده مش موجود.' });
+
+    const worker = (db.workers || []).find((w) => w.id === review.workerId);
+    if (!worker || worker.userId !== req.userId) {
+      return res.status(403).json({ message: 'مش مسموحلك ترد على التقييم ده.' });
+    }
+
+    review.workerReply = String(reply).trim();
+    review.workerReplyAt = new Date().toISOString();
+    writeDB(db);
+
+    res.json(review);
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+// ── تعديل بروفايل الصنايعي (محمي) ─────────────────────────
+const WORKER_EDITABLE_FIELDS = [
+  'fullName',
+  'trade',
+  'tradeLabel',
+  'city',
+  'hourlyRate',
+  'yearsOfExperience',
+  'serviceRadius',
+  'bio',
+  'avatarColor',
+  'skills',
+  'isAvailable',
+];
+
+function updateWorkerProfile(req, res) {
+  const db = readDB();
+  const worker = (db.workers || []).find((w) => w.id === req.params.id);
+  if (!worker) return res.status(404).json({ message: 'مش لاقي بيانات الصنايعي.' });
+
+  const isOwner = worker.userId === req.userId;
+  const isAdmin = req.userRole === 'admin';
+  if (!isOwner && !isAdmin) {
+    return res.status(403).json({ message: 'مش مسموحلك تعدّل البروفايل ده.' });
+  }
+
+  for (const field of WORKER_EDITABLE_FIELDS) {
+    if (field in req.body) {
+      worker[field] = req.body[field];
+    }
+  }
+
+  writeDB(db);
+  res.json(worker);
+}
+
+app.put('/workers/:id', verifyToken, updateWorkerProfile);
+app.patch('/workers/:id', verifyToken, updateWorkerProfile);
+
+app.post('/workers', verifyToken, (req, res) => {
+  const db = readDB();
+  if (!db.workers) db.workers = [];
+  const newItem = { id: crypto.randomUUID(), ...req.body, userId: req.userId };
+  db.workers.push(newItem);
+  writeDB(db);
+  res.status(201).json(newItem);
+});
+
+app.delete('/workers/:id', verifyToken, (req, res) => {
+  const db = readDB();
+  const item = (db.workers || []).find((w) => w.id === req.params.id);
+  if (!item) return res.json({ success: true });
+  if (item.userId !== req.userId && req.userRole !== 'admin') {
+    return res.status(403).json({ message: 'مش مسموحلك تحذف البروفايل ده.' });
+  }
+  db.workers = (db.workers || []).filter((w) => w.id !== req.params.id);
+  writeDB(db);
+  res.json({ success: true });
+});
+
+// ============ WORKERS — قراءة عامة (Public) ============
 const SPECIAL_QUERY_KEYS = ['_sort', '_order', '_limit', '_page'];
 
-// ⚠️⚠️ الفيكس الحرج: أي GET عام على /workers لازم يستثني أي صنايعي
-// الـ user المرتبط بيه status != 'active' — وإلا صنايعية pending/blocked/rejected
-// هيفضلوا ظاهرين للعملاء في find-services وكأن حسابهم متوافق عليه فعليًا
-collections.forEach((collection) => {
-  app.get(`/${collection}`, (req, res) => {
-    const db = readDB();
-    let items = db[collection] || [];
-    const query = req.query;
+function applyQueryFilters(items, query) {
+  let result = items;
+  Object.keys(query).forEach((key) => {
+    if (SPECIAL_QUERY_KEYS.includes(key)) return;
+    result = result.filter((item) => String(item[key]) === String(query[key]));
+  });
 
-    if (collection === 'workers') {
-      items = items.filter((worker) => {
-        const owner = (db.users || []).find((u) => u.id === worker.userId);
-        return !owner || owner.status === 'active';
-      });
-    }
-
-    Object.keys(query).forEach((key) => {
-      if (SPECIAL_QUERY_KEYS.includes(key)) return;
-      items = items.filter((item) => String(item[key]) === String(query[key]));
+  if (query._sort) {
+    const order = query._order === 'desc' ? -1 : 1;
+    result = [...result].sort((a, b) => {
+      const field = query._sort;
+      if (a[field] < b[field]) return -1 * order;
+      if (a[field] > b[field]) return 1 * order;
+      return 0;
     });
+  }
 
-    if (query._sort) {
-      const order = query._order === 'desc' ? -1 : 1;
-      items = [...items].sort((a, b) => {
-        const field = query._sort;
-        if (a[field] < b[field]) return -1 * order;
-        if (a[field] > b[field]) return 1 * order;
-        return 0;
-      });
-    }
+  if (query._limit) {
+    result = result.slice(0, Number(query._limit));
+  }
 
-    if (query._limit) {
-      items = items.slice(0, Number(query._limit));
-    }
+  return result;
+}
 
-    res.json(items);
+app.get('/workers', (req, res) => {
+  const db = readDB();
+  let items = (db.workers || []).filter((worker) => {
+    const owner = (db.users || []).find((u) => u.id === worker.userId);
+    return !owner || owner.status === 'active';
   });
+  items = applyQueryFilters(items, req.query);
+  res.json(items);
 });
-// ⚠️ نفس الفكرة على /workers/:id — وإلا حد يقدر يوصل لبروفايل صنايعي pending
-// مباشرة لو عرف رابط الـ id بتاعه (مثلاً لو حفظ اللينك قبل ما يتقبل)
-collections.forEach((collection) => {
-  app.get(`/${collection}/:id`, (req, res) => {
-    const db = readDB();
-    const item = (db[collection] || []).find((x) => String(x.id) === req.params.id);
-    if (!item) return res.status(404).json({ message: 'Not Found' });
 
-    if (collection === 'workers') {
-      const owner = (db.users || []).find((u) => u.id === item.userId);
-      if (owner && owner.status !== 'active') {
-        return res.status(404).json({ message: 'Not Found' });
+app.get('/workers/:id', (req, res) => {
+  const db = readDB();
+  const item = (db.workers || []).find((w) => w.id === req.params.id);
+  if (!item) return res.status(404).json({ message: 'Not Found' });
+
+  const owner = (db.users || []).find((u) => u.id === item.userId);
+  if (owner && owner.status !== 'active') {
+    return res.status(404).json({ message: 'Not Found' });
+  }
+
+  res.json(item);
+});
+
+// ============ REVIEWS ============
+function recomputeWorkerRating(db, workerId) {
+  const reviews = (db.reviews || []).filter((r) => r.workerId === workerId);
+  const reviewsCount = reviews.length;
+  const rating = reviewsCount > 0
+    ? Math.round((reviews.reduce((sum, r) => sum + r.rating, 0) / reviewsCount) * 10) / 10
+    : 0;
+  const worker = (db.workers || []).find((w) => w.id === workerId);
+  if (worker) {
+    worker.rating = rating;
+    worker.reviewsCount = reviewsCount;
+  }
+}
+
+app.get('/reviews', (req, res) => {
+  const db = readDB();
+  const items = applyQueryFilters(db.reviews || [], req.query);
+  res.json(items);
+});
+
+app.get('/reviews/:id', (req, res) => {
+  const db = readDB();
+  const item = (db.reviews || []).find((r) => r.id === req.params.id);
+  if (!item) return res.status(404).json({ message: 'Not Found' });
+  res.json(item);
+});
+
+app.post('/reviews', verifyToken, (req, res) => {
+  try {
+    const { bookingId, clientName, workerId, rating, comment } = req.body;
+
+    if (!bookingId || !workerId || rating == null) {
+      return res.status(400).json({ message: 'بيانات التقييم ناقصة.' });
+    }
+    const numRating = Number(rating);
+    if (!Number.isFinite(numRating) || numRating < 1 || numRating > 5) {
+      return res.status(400).json({ message: 'التقييم لازم يكون رقم من 1 لـ 5.' });
+    }
+
+    const db = readDB();
+    const booking = (db.bookings || []).find((b) => b.id === bookingId);
+    if (!booking) return res.status(404).json({ message: 'الحجز ده مش موجود.' });
+
+    if (booking.clientId !== req.userId) {
+      return res.status(403).json({ message: 'مش مسموحلك تقيّم الحجز ده.' });
+    }
+    if (booking.status !== 'completed') {
+      return res.status(400).json({ message: 'تقدر تقيّم بس بعد ما الشغل يخلص.' });
+    }
+    if (booking.workerId !== workerId) {
+      return res.status(400).json({ message: 'بيانات التقييم مش متطابقة مع الحجز.' });
+    }
+
+    const alreadyReviewed = (db.reviews || []).find((r) => r.bookingId === bookingId);
+    if (alreadyReviewed) {
+      return res.status(409).json({ message: 'قيّمت الحجز ده قبل كده.' });
+    }
+
+    if (!db.reviews) db.reviews = [];
+    const newReview = {
+      id: crypto.randomUUID(),
+      bookingId,
+      clientId: req.userId,
+      clientName: clientName ?? '',
+      workerId,
+      rating: numRating,
+      comment: comment ?? '',
+      createdAt: new Date().toISOString(),
+    };
+    db.reviews.push(newReview);
+    recomputeWorkerRating(db, workerId);
+    writeDB(db);
+
+    res.status(201).json(newReview);
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
+});
+
+app.patch('/reviews/:id', verifyToken, (req, res) => {
+  try {
+    const db = readDB();
+    const review = (db.reviews || []).find((r) => r.id === req.params.id);
+    if (!review) return res.status(404).json({ message: 'التقييم ده مش موجود.' });
+
+    if (review.clientId !== req.userId && req.userRole !== 'admin') {
+      return res.status(403).json({ message: 'مش مسموحلك تعدّل التقييم ده.' });
+    }
+
+    if ('rating' in req.body) {
+      const numRating = Number(req.body.rating);
+      if (!Number.isFinite(numRating) || numRating < 1 || numRating > 5) {
+        return res.status(400).json({ message: 'التقييم لازم يكون رقم من 1 لـ 5.' });
       }
+      review.rating = numRating;
     }
+    if ('comment' in req.body) {
+      review.comment = req.body.comment;
+    }
+    review.updatedAt = new Date().toISOString();
 
-    res.json(item);
-  });
+    recomputeWorkerRating(db, review.workerId);
+    writeDB(db);
+    res.json(review);
+  } catch (err) {
+    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+  }
 });
 
-collections.forEach((collection) => {
-  app.post(`/${collection}`, (req, res) => {
-    const db = readDB();
-    if (!db[collection]) db[collection] = [];
-    const newItem = { id: Date.now().toString() + Math.random().toString(36).slice(2, 6), ...req.body };
-    db[collection].push(newItem);
-    writeDB(db);
-    res.status(201).json(newItem);
-  });
+app.delete('/reviews/:id', verifyAdmin, (req, res) => {
+  const db = readDB();
+  const review = (db.reviews || []).find((r) => r.id === req.params.id);
+  if (!review) return res.status(404).json({ message: 'مش لاقي التقييم ده.' });
+
+  db.reviews = (db.reviews || []).filter((r) => r.id !== req.params.id);
+  recomputeWorkerRating(db, review.workerId);
+  writeDB(db);
+  res.json({ success: true });
 });
 
-collections.forEach((collection) => {
-  const updateHandler = (req, res) => {
-    const db = readDB();
-    const index = (db[collection] || []).findIndex((x) => String(x.id) === req.params.id);
-    if (index === -1) return res.status(404).json({ message: 'Not Found' });
-    db[collection][index] = { ...db[collection][index], ...req.body };
-    writeDB(db);
-    res.json(db[collection][index]);
+// ============ BOOKINGS — الباقي (GET/PATCH/PUT/DELETE) ============
+function canAccessBooking(req, booking, db) {
+  if (req.userRole === 'admin') return true;
+  if (booking.clientId === req.userId) return true;
+  const worker = (db.workers || []).find((w) => w.id === booking.workerId);
+  return !!(worker && worker.userId === req.userId);
+}
+
+app.get('/bookings', verifyToken, (req, res) => {
+  const db = readDB();
+  let items = applyQueryFilters(db.bookings || [], req.query);
+  if (req.userRole !== 'admin') {
+    items = items.filter((b) => canAccessBooking(req, b, db));
+  }
+  res.json(items);
+});
+
+app.get('/bookings/:id', verifyToken, (req, res) => {
+  const db = readDB();
+  const item = (db.bookings || []).find((b) => b.id === req.params.id);
+  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!canAccessBooking(req, item, db)) {
+    return res.status(403).json({ message: 'مش مسموحلك تشوف الحجز ده.' });
+  }
+  res.json(item);
+});
+
+function updateBookingHandler(req, res) {
+  const db = readDB();
+  const index = (db.bookings || []).findIndex((b) => b.id === req.params.id);
+  if (index === -1) return res.status(404).json({ message: 'Not Found' });
+  if (!canAccessBooking(req, db.bookings[index], db)) {
+    return res.status(403).json({ message: 'مش مسموحلك تعدّل الحجز ده.' });
+  }
+  const { clientId, workerId, ...safeChanges } = req.body;
+  db.bookings[index] = { ...db.bookings[index], ...safeChanges };
+  writeDB(db);
+  res.json(db.bookings[index]);
+}
+app.put('/bookings/:id', verifyToken, updateBookingHandler);
+app.patch('/bookings/:id', verifyToken, updateBookingHandler);
+
+app.delete('/bookings/:id', verifyToken, (req, res) => {
+  const db = readDB();
+  const item = (db.bookings || []).find((b) => b.id === req.params.id);
+  if (!item) return res.json({ success: true });
+  if (!canAccessBooking(req, item, db)) {
+    return res.status(403).json({ message: 'مش مسموحلك تحذف الحجز ده.' });
+  }
+  db.bookings = (db.bookings || []).filter((b) => b.id !== req.params.id);
+  writeDB(db);
+  res.json({ success: true });
+});
+
+// ============ CONVERSATIONS ============
+function canAccessConversation(req, conversation) {
+  return conversation.clientId === req.userId || conversation.workerId === req.userId;
+}
+
+app.get('/conversations', verifyToken, (req, res) => {
+  const db = readDB();
+  let items = applyQueryFilters(db.conversations || [], req.query);
+  items = items.filter((c) => canAccessConversation(req, c));
+  res.json(items);
+});
+
+app.get('/conversations/:id', verifyToken, (req, res) => {
+  const db = readDB();
+  const item = (db.conversations || []).find((c) => c.id === req.params.id);
+  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!canAccessConversation(req, item)) {
+    return res.status(403).json({ message: 'مش مسموحلك تشوف المحادثة دي.' });
+  }
+  res.json(item);
+});
+
+app.post('/conversations', verifyToken, (req, res) => {
+  const { clientId, workerId } = req.body;
+  if (req.userId !== clientId && req.userId !== workerId) {
+    return res.status(403).json({ message: 'مش مسموحلك تعمل المحادثة دي.' });
+  }
+  const db = readDB();
+  if (!db.conversations) db.conversations = [];
+  const newItem = { id: crypto.randomUUID(), ...req.body };
+  db.conversations.push(newItem);
+  writeDB(db);
+  res.status(201).json(newItem);
+});
+
+function updateConversationHandler(req, res) {
+  const db = readDB();
+  const index = (db.conversations || []).findIndex((c) => c.id === req.params.id);
+  if (index === -1) return res.status(404).json({ message: 'Not Found' });
+  if (!canAccessConversation(req, db.conversations[index])) {
+    return res.status(403).json({ message: 'مش مسموحلك تعدّل المحادثة دي.' });
+  }
+  db.conversations[index] = { ...db.conversations[index], ...req.body };
+  writeDB(db);
+  res.json(db.conversations[index]);
+}
+app.put('/conversations/:id', verifyToken, updateConversationHandler);
+app.patch('/conversations/:id', verifyToken, updateConversationHandler);
+
+app.delete('/conversations/:id', verifyToken, (req, res) => {
+  const db = readDB();
+  const item = (db.conversations || []).find((c) => c.id === req.params.id);
+  if (!item) return res.json({ success: true });
+  if (!canAccessConversation(req, item)) {
+    return res.status(403).json({ message: 'مش مسموحلك تحذف المحادثة دي.' });
+  }
+  db.conversations = (db.conversations || []).filter((c) => c.id !== req.params.id);
+  writeDB(db);
+  res.json({ success: true });
+});
+
+// ============ MESSAGES ============
+function canAccessMessage(req, message) {
+  return message.senderId === req.userId || message.recipientId === req.userId;
+}
+
+app.get('/messages', verifyToken, (req, res) => {
+  const db = readDB();
+  let items = applyQueryFilters(db.messages || [], req.query);
+  items = items.filter((m) => canAccessMessage(req, m));
+  res.json(items);
+});
+
+app.get('/messages/:id', verifyToken, (req, res) => {
+  const db = readDB();
+  const item = (db.messages || []).find((m) => m.id === req.params.id);
+  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!canAccessMessage(req, item)) {
+    return res.status(403).json({ message: 'مش مسموحلك تشوف الرسالة دي.' });
+  }
+  res.json(item);
+});
+
+app.post('/messages', verifyToken, (req, res) => {
+  const { conversationId, senderId, recipientId } = req.body;
+  if (req.userId !== senderId) {
+    return res.status(403).json({ message: 'مش مسموحلك تبعت رسالة نيابة عن حد تاني.' });
+  }
+  const db = readDB();
+  const conversation = (db.conversations || []).find((c) => c.id === conversationId);
+  if (!conversation || !canAccessConversation(req, conversation)) {
+    return res.status(403).json({ message: 'المحادثة دي مش موجودة أو مش بتاعتك.' });
+  }
+  if (!db.messages) db.messages = [];
+  const newItem = { id: crypto.randomUUID(), ...req.body };
+  db.messages.push(newItem);
+  writeDB(db);
+  res.status(201).json(newItem);
+});
+
+function updateMessageHandler(req, res) {
+  const db = readDB();
+  const index = (db.messages || []).findIndex((m) => m.id === req.params.id);
+  if (index === -1) return res.status(404).json({ message: 'Not Found' });
+  const message = db.messages[index];
+  if (message.recipientId !== req.userId) {
+    return res.status(403).json({ message: 'مش مسموحلك تعدّل الرسالة دي.' });
+  }
+  db.messages[index] = { ...message, ...req.body };
+  writeDB(db);
+  res.json(db.messages[index]);
+}
+app.put('/messages/:id', verifyToken, updateMessageHandler);
+app.patch('/messages/:id', verifyToken, updateMessageHandler);
+
+app.delete('/messages/:id', verifyToken, (req, res) => {
+  const db = readDB();
+  const item = (db.messages || []).find((m) => m.id === req.params.id);
+  if (!item) return res.json({ success: true });
+  if (!canAccessMessage(req, item)) {
+    return res.status(403).json({ message: 'مش مسموحلك تحذف الرسالة دي.' });
+  }
+  db.messages = (db.messages || []).filter((m) => m.id !== req.params.id);
+  writeDB(db);
+  res.json({ success: true });
+});
+
+// ============ NOTIFICATIONS ============
+function canAccessNotification(req, notification) {
+  return req.userRole === 'admin' || notification.userId === req.userId;
+}
+
+app.get('/notifications', verifyToken, (req, res) => {
+  const db = readDB();
+  let items = applyQueryFilters(db.notifications || [], req.query);
+  if (req.userRole !== 'admin') {
+    items = items.filter((n) => n.userId === req.userId);
+  }
+  res.json(items);
+});
+
+app.get('/notifications/:id', verifyToken, (req, res) => {
+  const db = readDB();
+  const item = (db.notifications || []).find((n) => n.id === req.params.id);
+  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!canAccessNotification(req, item)) {
+    return res.status(403).json({ message: 'مش مسموحلك تشوف الإشعار ده.' });
+  }
+  res.json(item);
+});
+
+app.post('/notifications', verifyToken, (req, res) => {
+  const db = readDB();
+  if (!db.notifications) db.notifications = [];
+  const newItem = {
+    id: crypto.randomUUID(),
+    isRead: false,
+    createdAt: new Date().toISOString(),
+    ...req.body,
   };
-  app.put(`/${collection}/:id`, updateHandler);
-  app.patch(`/${collection}/:id`, updateHandler);
+  db.notifications.push(newItem);
+  writeDB(db);
+  res.status(201).json(newItem);
 });
 
-collections.forEach((collection) => {
-  app.delete(`/${collection}/:id`, (req, res) => {
-    const db = readDB();
-    db[collection] = (db[collection] || []).filter((x) => String(x.id) !== req.params.id);
-    writeDB(db);
-    res.json({ success: true });
-  });
+function updateNotificationHandler(req, res) {
+  const db = readDB();
+  const index = (db.notifications || []).findIndex((n) => n.id === req.params.id);
+  if (index === -1) return res.status(404).json({ message: 'Not Found' });
+  if (!canAccessNotification(req, db.notifications[index])) {
+    return res.status(403).json({ message: 'مش مسموحلك تعدّل الإشعار ده.' });
+  }
+  db.notifications[index] = { ...db.notifications[index], ...req.body };
+  writeDB(db);
+  res.json(db.notifications[index]);
+}
+app.put('/notifications/:id', verifyToken, updateNotificationHandler);
+app.patch('/notifications/:id', verifyToken, updateNotificationHandler);
+
+app.delete('/notifications/:id', verifyToken, (req, res) => {
+  const db = readDB();
+  const item = (db.notifications || []).find((n) => n.id === req.params.id);
+  if (!item) return res.json({ success: true });
+  if (!canAccessNotification(req, item)) {
+    return res.status(403).json({ message: 'مش مسموحلك تحذف الإشعار ده.' });
+  }
+  db.notifications = (db.notifications || []).filter((n) => n.id !== req.params.id);
+  writeDB(db);
+  res.json({ success: true });
 });
 
 app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
 
 const port = process.env.PORT || 3000;
-// ⚠️ server.listen مش app.listen — عشان socket.io يشتغل على نفس البورت
 server.listen(port, () => console.log(`Server running on port ${port}`));
