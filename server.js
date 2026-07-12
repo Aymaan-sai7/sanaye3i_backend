@@ -218,6 +218,38 @@ async function sendAdminNotificationEmail(subject, htmlContent) {
   }
 }
 
+//  إيميل لمستخدم واحد بعينه (صنايعي وقت طلب جديد، أو عميل وقت ما
+// الصنايعي يقبل شغله) — نفس نمط sendAdminNotificationEmail بالظبط، بس
+// لمستقبل واحد مش كل الأدمنز. fire-and-forget برضو، فشل الإيميل مايوقفش
+// استجابة الـ endpoint الأساسي
+async function sendUserEmail(toEmail, toName, subject, htmlContent) {
+  try {
+    if (!toEmail) return;
+
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'api-key': process.env.BREVO_API_KEY,
+      },
+      body: JSON.stringify({
+        sender: { name: 'صنايعي', email: process.env.BREVO_SENDER_EMAIL },
+        to: [{ email: toEmail, name: toName || toEmail }],
+        subject,
+        htmlContent,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`User notification email failed (${response.status}):`, errorBody);
+    }
+  } catch (err) {
+    console.error('Failed to send user notification email:', err);
+  }
+}
+
 // ============ AUTH ENDPOINTS ============
 
 const loginLimiter = rateLimit({
@@ -1002,7 +1034,7 @@ app.post('/bookings', verifyToken, (req, res) => {
     const newBooking = {
       id: crypto.randomUUID(),
       ...bookingData,
-      // ⚠️ لازم يكون العميل صاحب الحساب اللي بعت الطلب ده — مش أي clientId
+      //  لازم يكون العميل صاحب الحساب اللي بعت الطلب ده — مش أي clientId
       // اتبعت في الـ body، وإلا حد يقدر يعمل حجز باسم عميل تاني
       clientId: req.userId,
       workStage: null,
@@ -1026,6 +1058,30 @@ app.post('/bookings', verifyToken, (req, res) => {
       }</p>
         <a href="${ALLOWED_ORIGIN}/admin/bookings" style="display:inline-block; background:#2563EB; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
           شوف الحجوزات
+        </a>
+      </div>
+      `
+    );
+
+    //  إيميل حقيقي للصنايعي نفسه (مش بس إشعار داخل الموقع) — بيوصله
+    // حتى لو مش فاتح صنايعي دلوقتي. بنجيب إيميله عن طريق worker.userId
+    const bookedWorker = (db.workers || []).find((w) => w.id === newBooking.workerId);
+    const bookedWorkerUser = bookedWorker
+      ? (db.users || []).find((u) => u.id === bookedWorker.userId)
+      : null;
+
+    sendUserEmail(
+      bookedWorkerUser?.email,
+      bookedWorkerUser?.fullName,
+      'طلب شغل جديد - صنايعي',
+      `
+      <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
+        <h2 style="color: #2563EB;">طلب شغل جديد</h2>
+        <p>أهلاً ${bookedWorkerUser?.fullName ?? ''}،</p>
+        <p><strong>${newBooking.clientName}</strong> طلب خدمتك (${newBooking.workerTrade}).</p>
+        <p>القيمة: ${newBooking.totalAmount} ج.م</p>
+        <a href="${ALLOWED_ORIGIN}/pro/requests" style="display:inline-block; background:#2563EB; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
+          شوف الطلب وقرر
         </a>
       </div>
       `
@@ -1128,11 +1184,12 @@ app.patch('/reviews/:id/reply', verifyToken, (req, res) => {
 });
 
 // ── تعديل بروفايل الصنايعي (محمي) ─────────────────────────
-const WORKER_EDITABLE_FIELDS = [
+//  trade/tradeLabel/city اتشالوا من هنا عمدًا — قرار بيزنس: الصنايعي
+// مايقدرش يغيّر تخصصه أو محافظته بعد التسجيل (عشان التوثيق والتقييمات
+// والبحث الجغرافي كلهم مبنيين على البيانات دي وقت الموافقة). التعديل
+// عليهم بقى مقصور على الأدمن بس، من endpoint إدارة المستخدمين.
+const WORKER_OWNER_EDITABLE_FIELDS = [
   'fullName',
-  'trade',
-  'tradeLabel',
-  'city',
   'hourlyRate',
   'yearsOfExperience',
   'serviceRadius',
@@ -1141,6 +1198,8 @@ const WORKER_EDITABLE_FIELDS = [
   'skills',
   'isAvailable',
 ];
+
+const WORKER_ADMIN_ONLY_FIELDS = ['trade', 'tradeLabel', 'city'];
 
 function updateWorkerProfile(req, res) {
   const db = readDB();
@@ -1153,7 +1212,11 @@ function updateWorkerProfile(req, res) {
     return res.status(403).json({ message: 'مش مسموحلك تعدّل البروفايل ده.' });
   }
 
-  for (const field of WORKER_EDITABLE_FIELDS) {
+  const allowedFields = isAdmin
+    ? [...WORKER_OWNER_EDITABLE_FIELDS, ...WORKER_ADMIN_ONLY_FIELDS]
+    : WORKER_OWNER_EDITABLE_FIELDS;
+
+  for (const field of allowedFields) {
     if (field in req.body) {
       worker[field] = req.body[field];
     }
@@ -1391,9 +1454,61 @@ function updateBookingHandler(req, res) {
   if (!canAccessBooking(req, db.bookings[index], db)) {
     return res.status(403).json({ message: 'مش مسموحلك تعدّل الحجز ده.' });
   }
+  const previousStatus = db.bookings[index].status;
   const { clientId, workerId, ...safeChanges } = req.body;
   db.bookings[index] = { ...db.bookings[index], ...safeChanges };
   writeDB(db);
+
+  //  إيميل حقيقي للعميل على كل تغيير مهم في حالة طلبه — بس لو الحالة
+  // فعلاً اتغيّرت (مش نفس الحالة القديمة)، عشان مانبعتش إيميلات مكررة على
+  // أي تعديل تاني (زي تعديل العنوان أو الميعاد)
+  const newStatus = safeChanges.status;
+  if (newStatus && newStatus !== previousStatus && ['active', 'completed', 'cancelled'].includes(newStatus)) {
+    const updatedBooking = db.bookings[index];
+    const client = (db.users || []).find((u) => u.id === updatedBooking.clientId);
+
+    const emailByStatus = {
+      active: {
+        subject: 'الصنايعي قبل طلبك - صنايعي',
+        color: '#16A34A',
+        title: 'الصنايعي قبل طلبك',
+        body: `<strong>${updatedBooking.workerName}</strong> قبل طلبك (${updatedBooking.workerTrade}) وهيبدأ الشغل عليه.`,
+        cta: 'شوف تفاصيل الطلب',
+      },
+      completed: {
+        subject: 'شغلك خلص - صنايعي',
+        color: '#2563EB',
+        title: 'الشغل خلص بنجاح',
+        body: `<strong>${updatedBooking.workerName}</strong> خلّص شغله معاك (${updatedBooking.workerTrade}). لو حابب، قيّم تجربتك عشان تفيد عملاء تانيين.`,
+        cta: 'قيّم الصنايعي',
+      },
+      cancelled: {
+        subject: 'طلبك اتلغى - صنايعي',
+        color: '#DC2626',
+        title: 'الطلب اتلغى',
+        body: `للأسف طلبك مع <strong>${updatedBooking.workerName}</strong> (${updatedBooking.workerTrade}) اتلغى. تقدر تدور على صنايعي تاني في نفس التخصص.`,
+        cta: 'دور على صنايعي تاني',
+      },
+    };
+    const emailContent = emailByStatus[newStatus];
+
+    sendUserEmail(
+      client?.email,
+      client?.fullName,
+      emailContent.subject,
+      `
+      <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
+        <h2 style="color: ${emailContent.color};">${emailContent.title}</h2>
+        <p>أهلاً ${client?.fullName ?? ''}،</p>
+        <p>${emailContent.body}</p>
+        <a href="${ALLOWED_ORIGIN}/orders/${updatedBooking.id}" style="display:inline-block; background:${emailContent.color}; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
+          ${emailContent.cta}
+        </a>
+      </div>
+      `
+    );
+  }
+
   res.json(db.bookings[index]);
 }
 app.put('/bookings/:id', verifyToken, updateBookingHandler);
@@ -1602,7 +1717,7 @@ app.delete('/notifications/:id', verifyToken, (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/', (req, res) => res.send('Sanaye3i Backend is Running 🚀'));
+app.get('/', (req, res) => res.send('Sanaye3i Backend is Running '));
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => console.log(`Server running on port ${port}`));
