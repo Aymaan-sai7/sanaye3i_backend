@@ -1,36 +1,61 @@
-const crypto = require('crypto');
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const rateLimit = require('express-rate-limit');
-const multer = require('multer');
-const http = require('http');
-const { Server } = require('socket.io');
+const crypto = require("crypto");
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
+const multer = require("multer");
+const http = require("http");
+const { Server } = require("socket.io");
 const app = express();
 
-app.set('trust proxy', 1);
+app.set("trust proxy", 1);
 
-const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:4200';
-app.use(cors({ origin: ALLOWED_ORIGIN }));
-app.use(express.json());
+const ALLOWED_ORIGIN = process.env.FRONTEND_URL || "http://localhost:4200";
+const COOKIE_NAME = "sanaye3i_token";
+const corsOptions = {
+  origin: ALLOWED_ORIGIN,
+  credentials: true,
+};
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+app.use(cors(corsOptions));
+app.use(express.json({ limit: "10mb" }));
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  next();
+});
+
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 const BOOTSTRAP_SECRET = process.env.ADMIN_BOOTSTRAP_SECRET;
 
 const DB_FILE = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/db.json`
-  : './db.json';
+  : "./db.json";
 
 if (!fs.existsSync(DB_FILE)) {
-  const initialData = { users: [], workers: [], bookings: [], reviews: [], messages: [], conversations: [], notifications: [] };
+  const initialData = {
+    users: [],
+    workers: [],
+    bookings: [],
+    reviews: [],
+    messages: [],
+    conversations: [],
+    notifications: [],
+  };
   fs.writeFileSync(DB_FILE, JSON.stringify(initialData, null, 2));
 }
 
-function readDB() { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-function writeDB(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
+function readDB() {
+  return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+}
+function writeDB(data) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+}
 
 function ensureNotificationsCollection() {
   const db = readDB();
@@ -61,7 +86,7 @@ ensureAdminLogsCollection();
 
 const UPLOADS_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/uploads`
-  : './uploads';
+  : "./uploads";
 
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -79,20 +104,107 @@ const upload = multer({
   storage,
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+    const allowed = [
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+      "application/pdf",
+    ];
     if (!allowed.includes(file.mimetype)) {
-      return cb(new Error('نوع الملف مش مسموح به. استخدم صورة أو PDF.'));
+      return cb(new Error("نوع الملف مش مسموح به. استخدم صورة أو PDF."));
     }
     cb(null, true);
   },
 });
 
-app.use('/uploads', express.static(UPLOADS_DIR));
+app.use(
+  "/uploads",
+  (req, res, next) => {
+    const token = getTokenFromRequest(req);
+    if (!token) {
+      return res.status(401).json({ message: "غير مصرح بالوصول للمستندات." });
+    }
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (!decoded?.id) {
+        return res.status(401).json({ message: "غير مصرح بالوصول للمستندات." });
+      }
+      next();
+    } catch {
+      return res.status(401).json({ message: "الجلسة منتهية، سجل دخول تاني." });
+    }
+  },
+  express.static(UPLOADS_DIR),
+);
 
 function sanitizeUser(user) {
   const { password, resetPasswordToken, resetPasswordExpiry, ...safe } = user;
   return safe;
 }
+
+function parseCookies(req) {
+  const cookieHeader = req.headers.cookie || "";
+  return cookieHeader.split(";").reduce((acc, part) => {
+    const [rawName, ...rawValue] = part.trim().split("=");
+    if (!rawName) return acc;
+    const name = rawName.trim();
+    const value = decodeURIComponent(rawValue.join("=") || "");
+    acc[name] = value;
+    return acc;
+  }, {});
+}
+
+function getTokenFromRequest(req) {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return authHeader.split(" ")[1];
+  }
+  const cookies = parseCookies(req);
+  return cookies[COOKIE_NAME] || null;
+}
+
+function setAuthCookie(res, token) {
+  const isSecure =
+    process.env.NODE_ENV === "production" || process.env.HTTPS === "true";
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: isSecure,
+    sameSite: "lax",
+    path: "/",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+}
+
+function clearAuthCookie(res) {
+  const isSecure =
+    process.env.NODE_ENV === "production" || process.env.HTTPS === "true";
+  res.clearCookie(COOKIE_NAME, {
+    httpOnly: true,
+    secure: isSecure,
+    sameSite: "lax",
+    path: "/",
+  });
+}
+
+function isValidString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function sanitizeText(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function assertJsonBody(req, res, next) {
+  if (req.is("application/json")) {
+    return next();
+  }
+  if (Object.keys(req.body || {}).length === 0) {
+    return next();
+  }
+  return next();
+}
+
+app.use(assertJsonBody);
 
 // ============ ADMIN AUDIT LOG ============
 function logAdminAction(req, action, targetType, targetId, details) {
@@ -119,56 +231,66 @@ function logAdminAction(req, action, targetType, targetId, details) {
 
     writeDB(db);
   } catch (err) {
-    console.error('Failed to write admin log:', err);
+    console.error("Failed to write admin log:", err);
   }
 }
 
 // ============ WEBSOCKET (Socket.IO) ============
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: ALLOWED_ORIGIN },
+  cors: {
+    origin: ALLOWED_ORIGIN,
+    credentials: true,
+  },
 });
 
 io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
-  if (!token) return next(new Error('unauthorized'));
+  const tokenFromAuth = socket.handshake.auth?.token;
+  const tokenFromCookie = socket.handshake.headers?.cookie
+    ? getTokenFromRequest({ headers: socket.handshake.headers })
+    : null;
+  const token = tokenFromAuth || tokenFromCookie;
+
+  if (!token) return next(new Error("unauthorized"));
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded.role !== 'admin') return next(new Error('forbidden'));
+    if (decoded.role !== "admin") return next(new Error("forbidden"));
     socket.userId = decoded.id;
     next();
   } catch {
-    next(new Error('unauthorized'));
+    next(new Error("unauthorized"));
   }
 });
 
-io.on('connection', (socket) => {
-  socket.join('admins');
+io.on("connection", (socket) => {
+  socket.join("admins");
 });
 
 function broadcastPendingApprovals() {
   const db = readDB();
-  const pendingApprovals = (db.users || []).filter((u) => u.status === 'pending').length;
-  io.to('admins').emit('admin:pendingApprovalsChanged', { pendingApprovals });
+  const pendingApprovals = (db.users || []).filter(
+    (u) => u.status === "pending",
+  ).length;
+  io.to("admins").emit("admin:pendingApprovalsChanged", { pendingApprovals });
 }
 
 // ============ EMAIL (Brevo HTTP API) ============
 async function sendResetPasswordEmail(toEmail, fullName, resetLink) {
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
     headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      'api-key': process.env.BREVO_API_KEY,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "api-key": process.env.BREVO_API_KEY,
     },
     body: JSON.stringify({
-      sender: { name: 'صنايعي', email: process.env.BREVO_SENDER_EMAIL },
+      sender: { name: "صنايعي", email: process.env.BREVO_SENDER_EMAIL },
       to: [{ email: toEmail, name: fullName || toEmail }],
-      subject: 'إعادة تعيين كلمة المرور - صنايعي',
+      subject: "إعادة تعيين كلمة المرور - صنايعي",
       htmlContent: `
       <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
         <h2 style="color: #2563EB;">صنايعي</h2>
-        <p>أهلاً ${fullName || ''}،</p>
+        <p>أهلاً ${fullName || ""}،</p>
         <p>وصلنا طلب لإعادة تعيين كلمة المرور بتاعة حسابك. اضغط على الزرار ده عشان تعمل باسورد جديد:</p>
         <a href="${resetLink}" style="display:inline-block; background:#2563EB; color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; margin: 16px 0;">
           إعادة تعيين كلمة المرور
@@ -189,20 +311,20 @@ async function sendAdminNotificationEmail(subject, htmlContent) {
   try {
     const db = readDB();
     const adminEmails = (db.users || [])
-      .filter((u) => u.role === 'admin' && u.email)
+      .filter((u) => u.role === "admin" && u.email)
       .map((u) => u.email);
 
     if (adminEmails.length === 0) return;
 
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'api-key': process.env.BREVO_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "api-key": process.env.BREVO_API_KEY,
       },
       body: JSON.stringify({
-        sender: { name: 'صنايعي', email: process.env.BREVO_SENDER_EMAIL },
+        sender: { name: "صنايعي", email: process.env.BREVO_SENDER_EMAIL },
         to: adminEmails.map((email) => ({ email })),
         subject,
         htmlContent,
@@ -211,10 +333,13 @@ async function sendAdminNotificationEmail(subject, htmlContent) {
 
     if (!response.ok) {
       const errorBody = await response.text();
-      console.error(`Admin notification email failed (${response.status}):`, errorBody);
+      console.error(
+        `Admin notification email failed (${response.status}):`,
+        errorBody,
+      );
     }
   } catch (err) {
-    console.error('Failed to send admin notification email:', err);
+    console.error("Failed to send admin notification email:", err);
   }
 }
 
@@ -226,15 +351,15 @@ async function sendUserEmail(toEmail, toName, subject, htmlContent) {
   try {
     if (!toEmail) return;
 
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'api-key': process.env.BREVO_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "api-key": process.env.BREVO_API_KEY,
       },
       body: JSON.stringify({
-        sender: { name: 'صنايعي', email: process.env.BREVO_SENDER_EMAIL },
+        sender: { name: "صنايعي", email: process.env.BREVO_SENDER_EMAIL },
         to: [{ email: toEmail, name: toName || toEmail }],
         subject,
         htmlContent,
@@ -243,10 +368,13 @@ async function sendUserEmail(toEmail, toName, subject, htmlContent) {
 
     if (!response.ok) {
       const errorBody = await response.text();
-      console.error(`User notification email failed (${response.status}):`, errorBody);
+      console.error(
+        `User notification email failed (${response.status}):`,
+        errorBody,
+      );
     }
   } catch (err) {
-    console.error('Failed to send user notification email:', err);
+    console.error("Failed to send user notification email:", err);
   }
 }
 
@@ -255,7 +383,7 @@ async function sendUserEmail(toEmail, toName, subject, htmlContent) {
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
-  message: { message: 'محاولات كتير غلط، حاول تاني بعد شوية.' },
+  message: { message: "محاولات كتير غلط، حاول تاني بعد شوية." },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -263,7 +391,7 @@ const loginLimiter = rateLimit({
 const registerLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 10,
-  message: { message: 'محاولات تسجيل كتير، حاول تاني بعد شوية.' },
+  message: { message: "محاولات تسجيل كتير، حاول تاني بعد شوية." },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -271,61 +399,88 @@ const registerLimiter = rateLimit({
 const forgotPasswordLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
-  message: { message: 'محاولات كتير، حاول تاني بعد شوية.' },
+  message: { message: "محاولات كتير، حاول تاني بعد شوية." },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-app.post('/auth/register', registerLimiter, async (req, res) => {
+app.post("/auth/register", registerLimiter, async (req, res) => {
   try {
-    const { email, password, fullName, role, nationalId, mobileNumber, workerData } = req.body;
+    const {
+      email,
+      password,
+      fullName,
+      role,
+      nationalId,
+      mobileNumber,
+      workerData,
+    } = req.body;
+
+    if (
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      typeof fullName !== "string"
+    ) {
+      return res.status(400).json({ message: "بيانات غير صحيحة." });
+    }
 
     if (!email || !password || !fullName || !role) {
-      return res.status(400).json({ message: 'بيانات ناقصة.' });
+      return res.status(400).json({ message: "بيانات ناقصة." });
     }
     if (password.length < 8) {
-      return res.status(400).json({ message: 'الباسورد لازم يكون 8 حروف على الأقل.' });
+      return res
+        .status(400)
+        .json({ message: "الباسورد لازم يكون 8 حروف على الأقل." });
     }
-    if (role !== 'client' && role !== 'pro') {
-      return res.status(400).json({ message: 'نوع الحساب غير صالح.' });
+    if (role !== "client" && role !== "pro") {
+      return res.status(400).json({ message: "نوع الحساب غير صالح." });
     }
-    if (role === 'pro' && !workerData) {
-      return res.status(400).json({ message: 'بيانات الصنايعي ناقصة.' });
+    if (role === "pro" && !workerData) {
+      return res.status(400).json({ message: "بيانات الصنايعي ناقصة." });
     }
     if (!nationalId || !/^\d{14}$/.test(nationalId)) {
-      return res.status(400).json({ message: 'الرقم القومي لازم يكون 14 رقم صحيح.' });
+      return res
+        .status(400)
+        .json({ message: "الرقم القومي لازم يكون 14 رقم صحيح." });
     }
     if (!mobileNumber || !/^01[0125]\d{8}$/.test(mobileNumber)) {
-      return res.status(400).json({ message: 'رقم الموبايل غير صحيح.' });
+      return res.status(400).json({ message: "رقم الموبايل غير صحيح." });
     }
 
     const db = readDB();
 
-    const emailExists = db.users.find((u) => u.email === email);
+    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedFullName = fullName.trim();
+
+    const emailExists = db.users.find((u) => u.email === normalizedEmail);
     if (emailExists) {
-      return res.status(409).json({ message: 'البريد الإلكتروني ده مسجل بالفعل.' });
+      return res
+        .status(409)
+        .json({ message: "البريد الإلكتروني ده مسجل بالفعل." });
     }
 
     const nationalIdExists = db.users.find((u) => u.nationalId === nationalId);
     if (nationalIdExists) {
-      return res.status(409).json({ message: 'الرقم القومي ده مسجل بحساب تاني بالفعل.' });
+      return res
+        .status(409)
+        .json({ message: "الرقم القومي ده مسجل بحساب تاني بالفعل." });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const newUser = {
       id: crypto.randomUUID(),
-      email,
+      email: normalizedEmail,
       password: hashedPassword,
-      fullName,
+      fullName: normalizedFullName,
       role,
       nationalId,
       mobileNumber,
-      status: 'pending',
+      status: "pending",
       createdAt: new Date().toISOString(),
     };
 
     let newWorker = null;
-    if (role === 'pro') {
+    if (role === "pro") {
       newWorker = {
         id: crypto.randomUUID(),
         userId: newUser.id,
@@ -340,8 +495,8 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
         reviewsCount: 0,
         isAvailable: false,
         completedJobs: 0,
-        bio: workerData.bio ?? '',
-        avatarColor: workerData.avatarColor ?? '#2563EB',
+        bio: workerData.bio ?? "",
+        avatarColor: workerData.avatarColor ?? "#2563EB",
         skills: Array.isArray(workerData.skills) ? workerData.skills : [],
       };
     }
@@ -353,94 +508,137 @@ app.post('/auth/register', registerLimiter, async (req, res) => {
     broadcastPendingApprovals();
 
     sendAdminNotificationEmail(
-      'طلب تسجيل جديد - صنايعي',
+      "طلب تسجيل جديد - صنايعي",
       `
       <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
         <h2 style="color: #2563EB;">طلب تسجيل جديد</h2>
-        <p><strong>${fullName}</strong> سجّل حساب جديد كـ ${role === 'pro' ? 'صنايعي' : 'عميل'}${
-        role === 'pro' && newWorker ? ` (${newWorker.tradeLabel})` : ''
-      }.</p>
+        <p><strong>${fullName}</strong> سجّل حساب جديد كـ ${role === "pro" ? "صنايعي" : "عميل"}${
+          role === "pro" && newWorker ? ` (${newWorker.tradeLabel})` : ""
+        }.</p>
         <p>ادخل لوحة التحكم عشان تراجع الطلب وتوافق عليه أو ترفضه.</p>
         <a href="${ALLOWED_ORIGIN}/admin/registrations" style="display:inline-block; background:#2563EB; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
           مراجعة الطلب
         </a>
       </div>
-      `
+      `,
     );
 
-    const docsUploadToken = jwt.sign({ id: newUser.id, role: newUser.role }, JWT_SECRET, {
-      expiresIn: '15m',
-    });
+    const docsUploadToken = jwt.sign(
+      { id: newUser.id, role: newUser.role },
+      JWT_SECRET,
+      {
+        expiresIn: "15m",
+      },
+    );
 
     res.status(201).json({
-      message: 'طلبك اتبعت للمراجعة، هنراجعه ونرد عليك في أقرب وقت.',
+      message: "طلبك اتبعت للمراجعة، هنراجعه ونرد عليك في أقرب وقت.",
       user: sanitizeUser(newUser),
       worker: newWorker,
       docsUploadToken,
     });
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
-app.post('/auth/login', loginLimiter, async (req, res) => {
+app.post("/auth/login", loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ message: 'بيانات ناقصة.' });
+    if (typeof email !== "string" || typeof password !== "string") {
+      return res.status(400).json({ message: "بيانات غير صحيحة." });
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail || !password) {
+      return res.status(400).json({ message: "بيانات ناقصة." });
     }
 
     const db = readDB();
     const user = db.users.find((u) => u.email === email);
 
     if (!user) {
-      return res.status(401).json({ message: 'الحساب ده مش موجود، سجل حساب جديد الأول.' });
+      return res
+        .status(401)
+        .json({ message: "الحساب ده مش موجود، سجل حساب جديد الأول." });
     }
 
     const match = await bcrypt.compare(password, user.password);
     if (!match) {
-      return res.status(401).json({ message: 'كلمة المرور غلط.' });
+      return res.status(401).json({ message: "كلمة المرور غلط." });
     }
 
-    if (user.status === 'pending') {
-      return res.status(403).json({ message: 'حسابك لسه قيد المراجعة من الأدمن، هنبلغك أول ما يتم قبوله.' });
+    if (user.status === "pending") {
+      return res.status(403).json({
+        message: "حسابك لسه قيد المراجعة من الأدمن، هنبلغك أول ما يتم قبوله.",
+      });
     }
-    if (user.status === 'blocked') {
-      return res.status(403).json({ message: 'حسابك متحظور. تواصل مع الدعم لو محتاج توضيح.' });
+    if (user.status === "blocked") {
+      return res
+        .status(403)
+        .json({ message: "حسابك متحظور. تواصل مع الدعم لو محتاج توضيح." });
     }
-    if (user.status === 'rejected') {
-      return res.status(403).json({ message: 'للأسف طلب انضمامك اتقفل. تواصل مع الدعم لو حابب تفاصيل.' });
+    if (user.status === "rejected") {
+      return res.status(403).json({
+        message: "للأسف طلب انضمامك اتقفل. تواصل مع الدعم لو حابب تفاصيل.",
+      });
     }
 
-    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ user: sanitizeUser(user), token });
+    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, {
+      expiresIn: "7d",
+    });
+    setAuthCookie(res, token);
+    res.json({ user: sanitizeUser(user) });
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
+  }
+});
+
+app.post("/auth/logout", (req, res) => {
+  clearAuthCookie(res);
+  res.json({ message: "تم تسجيل الخروج بنجاح." });
+});
+
+app.get("/auth/me", verifyToken, (req, res) => {
+  try {
+    const db = readDB();
+    const user = (db.users || []).find((u) => u.id === req.userId);
+    if (!user) {
+      return res.status(404).json({ message: "الحساب مش موجود." });
+    }
+    res.json({ user: sanitizeUser(user) });
+  } catch (err) {
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
 // ============ FORGOT / RESET PASSWORD ============
 
-app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
+app.post("/auth/forgot-password", forgotPasswordLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) {
-      return res.status(400).json({ message: 'من فضلك أدخل البريد الإلكتروني.' });
+      return res
+        .status(400)
+        .json({ message: "من فضلك أدخل البريد الإلكتروني." });
     }
 
     const db = readDB();
     const user = db.users.find((u) => u.email === email);
 
     const genericResponse = {
-      message: 'لو البريد الإلكتروني ده مسجل عندنا، هيوصلك لينك لإعادة تعيين كلمة المرور.',
+      message:
+        "لو البريد الإلكتروني ده مسجل عندنا، هيوصلك لينك لإعادة تعيين كلمة المرور.",
     };
 
     if (!user) {
       return res.json(genericResponse);
     }
 
-    const rawToken = crypto.randomBytes(32).toString('hex');
-    const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    const hashedToken = crypto
+      .createHash("sha256")
+      .update(rawToken)
+      .digest("hex");
 
     user.resetPasswordToken = hashedToken;
     user.resetPasswordExpiry = Date.now() + 60 * 60 * 1000;
@@ -451,43 +649,52 @@ app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
     try {
       await sendResetPasswordEmail(email, user.fullName, resetLink);
     } catch (emailErr) {
-      console.error('Failed to send reset email:', emailErr);
+      console.error("Failed to send reset email:", emailErr);
     }
 
     res.json(genericResponse);
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
-app.post('/auth/reset-password', async (req, res) => {
+app.post("/auth/reset-password", async (req, res) => {
   try {
     const { email, token, newPassword } = req.body;
 
     if (!email || !token || !newPassword) {
-      return res.status(400).json({ message: 'بيانات ناقصة.' });
+      return res.status(400).json({ message: "بيانات ناقصة." });
     }
     if (newPassword.length < 8) {
-      return res.status(400).json({ message: 'الباسورد لازم يكون 8 حروف على الأقل.' });
+      return res
+        .status(400)
+        .json({ message: "الباسورد لازم يكون 8 حروف على الأقل." });
     }
 
     const db = readDB();
     const user = db.users.find((u) => u.email === email);
 
     if (!user || !user.resetPasswordToken || !user.resetPasswordExpiry) {
-      return res.status(400).json({ message: 'الرابط ده غير صالح أو مستخدم قبل كده.' });
+      return res
+        .status(400)
+        .json({ message: "الرابط ده غير صالح أو مستخدم قبل كده." });
     }
 
     if (Date.now() > user.resetPasswordExpiry) {
       delete user.resetPasswordToken;
       delete user.resetPasswordExpiry;
       writeDB(db);
-      return res.status(400).json({ message: 'الرابط ده منتهي، اطلب لينك جديد.' });
+      return res
+        .status(400)
+        .json({ message: "الرابط ده منتهي، اطلب لينك جديد." });
     }
 
-    const hashedIncoming = crypto.createHash('sha256').update(token).digest('hex');
+    const hashedIncoming = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
     if (hashedIncoming !== user.resetPasswordToken) {
-      return res.status(400).json({ message: 'الرابط ده غير صالح.' });
+      return res.status(400).json({ message: "الرابط ده غير صالح." });
     }
 
     user.password = await bcrypt.hash(newPassword, 10);
@@ -495,158 +702,173 @@ app.post('/auth/reset-password', async (req, res) => {
     delete user.resetPasswordExpiry;
     writeDB(db);
 
-    res.json({ message: 'تم تغيير كلمة المرور بنجاح، سجل دخولك بالباسورد الجديد.' });
+    res.json({
+      message: "تم تغيير كلمة المرور بنجاح، سجل دخولك بالباسورد الجديد.",
+    });
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
 function verifyToken(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ message: 'غير مصرح.' });
+  const token = getTokenFromRequest(req);
+  if (!token) {
+    return res.status(401).json({ message: "غير مصرح." });
   }
-  const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded || typeof decoded.id !== "string") {
+      return res.status(401).json({ message: "الجلسة منتهية، سجل دخول تاني." });
+    }
     req.userId = decoded.id;
     req.userRole = decoded.role;
     next();
   } catch {
-    return res.status(401).json({ message: 'الجلسة منتهية، سجل دخول تاني.' });
+    return res.status(401).json({ message: "الجلسة منتهية، سجل دخول تاني." });
   }
 }
 
 function verifyAdmin(req, res, next) {
   verifyToken(req, res, () => {
-    if (req.userRole !== 'admin') {
-      return res.status(403).json({ message: 'غير مصرح لك بالوصول لده.' });
+    if (req.userRole !== "admin") {
+      return res.status(403).json({ message: "غير مصرح لك بالوصول لده." });
     }
     next();
   });
 }
 
 app.post(
-  '/workers/:workerId/verification-docs',
+  "/workers/:workerId/verification-docs",
   verifyToken,
   upload.fields([
-    { name: 'idFront', maxCount: 1 },
-    { name: 'idBack', maxCount: 1 },
-    { name: 'certificate', maxCount: 1 },
+    { name: "idFront", maxCount: 1 },
+    { name: "idBack", maxCount: 1 },
+    { name: "certificate", maxCount: 1 },
   ]),
   (req, res) => {
     try {
       const db = readDB();
       const worker = db.workers.find((w) => w.id === req.params.workerId);
-      if (!worker) return res.status(404).json({ message: 'مش لاقي بيانات الصنايعي.' });
+      if (!worker)
+        return res.status(404).json({ message: "مش لاقي بيانات الصنايعي." });
 
       if (worker.userId !== req.userId) {
-        return res.status(403).json({ message: 'مش مسموحلك بالتعديل ده.' });
+        return res.status(403).json({ message: "مش مسموحلك بالتعديل ده." });
       }
 
-      if (req.files?.['idFront']?.[0]) {
-        worker.idFrontUrl = `/uploads/${req.files['idFront'][0].filename}`;
+      if (req.files?.["idFront"]?.[0]) {
+        worker.idFrontUrl = `/uploads/${req.files["idFront"][0].filename}`;
       }
-      if (req.files?.['idBack']?.[0]) {
-        worker.idBackUrl = `/uploads/${req.files['idBack'][0].filename}`;
+      if (req.files?.["idBack"]?.[0]) {
+        worker.idBackUrl = `/uploads/${req.files["idBack"][0].filename}`;
       }
-      if (req.files?.['certificate']?.[0]) {
-        worker.certificateUrl = `/uploads/${req.files['certificate'][0].filename}`;
+      if (req.files?.["certificate"]?.[0]) {
+        worker.certificateUrl = `/uploads/${req.files["certificate"][0].filename}`;
       }
-      worker.verificationStatus = 'pending';
+      worker.verificationStatus = "pending";
 
       writeDB(db);
       res.json(worker);
     } catch (err) {
-      res.status(500).json({ message: 'حصل خطأ أثناء رفع الملفات.' });
+      res.status(500).json({ message: "حصل خطأ أثناء رفع الملفات." });
     }
-  }
+  },
 );
 
 app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError || err.message?.includes('نوع الملف')) {
-    return res.status(400).json({ message: err.message || 'خطأ في رفع الملف.' });
+  if (err instanceof multer.MulterError || err.message?.includes("نوع الملف")) {
+    return res
+      .status(400)
+      .json({ message: err.message || "خطأ في رفع الملف." });
   }
-  next(err);
+  if (err?.status === 400 || err?.name === "ValidationError") {
+    return res
+      .status(400)
+      .json({ message: err.message || "بيانات غير صحيحة." });
+  }
+  console.error("Unhandled error:", err);
+  return res.status(500).json({ message: "حصل خطأ في السيرفر." });
 });
 
 // ============ ADMIN ENDPOINTS ============
 
-app.get('/admin/stats', verifyAdmin, (req, res) => {
+app.get("/admin/stats", verifyAdmin, (req, res) => {
   const db = readDB();
   const users = db.users || [];
   res.json({
     totalUsers: users.length,
-    totalClients: users.filter((u) => u.role === 'client').length,
-    totalPros: users.filter((u) => u.role === 'pro').length,
-    pendingApprovals: users.filter((u) => u.status === 'pending').length,
-    blockedUsers: users.filter((u) => u.status === 'blocked').length,
+    totalClients: users.filter((u) => u.role === "client").length,
+    totalPros: users.filter((u) => u.role === "pro").length,
+    pendingApprovals: users.filter((u) => u.status === "pending").length,
+    blockedUsers: users.filter((u) => u.status === "blocked").length,
     totalBookings: (db.bookings || []).length,
     totalReviews: (db.reviews || []).length,
   });
 });
 
-app.get('/admin/logs', verifyAdmin, (req, res) => {
+app.get("/admin/logs", verifyAdmin, (req, res) => {
   const db = readDB();
   const limit = req.query.limit ? Number(req.query.limit) : 100;
   res.json((db.adminLogs || []).slice(0, limit));
 });
 
-app.get('/admin/users', verifyAdmin, (req, res) => {
+app.get("/admin/users", verifyAdmin, (req, res) => {
   const db = readDB();
   let users = db.users || [];
   const { role, status, search } = req.query;
 
   if (role) users = users.filter((u) => u.role === role);
-  if (status) users = users.filter((u) => (u.status ?? 'active') === status);
+  if (status) users = users.filter((u) => (u.status ?? "active") === status);
   if (search) {
     const q = String(search).toLowerCase();
     users = users.filter(
       (u) =>
         u.fullName?.toLowerCase().includes(q) ||
         u.email?.toLowerCase().includes(q) ||
-        u.nationalId?.includes(q)
+        u.nationalId?.includes(q),
     );
   }
 
   res.json(users.map(sanitizeUser));
 });
 
-app.get('/admin/users/:id', verifyAdmin, (req, res) => {
+app.get("/admin/users/:id", verifyAdmin, (req, res) => {
   const db = readDB();
   const user = (db.users || []).find((u) => u.id === req.params.id);
-  if (!user) return res.status(404).json({ message: 'مش لاقي المستخدم ده.' });
+  if (!user) return res.status(404).json({ message: "مش لاقي المستخدم ده." });
 
   const worker =
-    user.role === 'pro' ? (db.workers || []).find((w) => w.userId === user.id) : null;
+    user.role === "pro"
+      ? (db.workers || []).find((w) => w.userId === user.id)
+      : null;
 
   res.json({ user: sanitizeUser(user), worker });
 });
 
-app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
+app.patch("/admin/users/:id/status", verifyAdmin, (req, res) => {
   const { status } = req.body;
-  const validStatuses = ['pending', 'active', 'rejected', 'blocked'];
+  const validStatuses = ["pending", "active", "rejected", "blocked"];
   if (!validStatuses.includes(status)) {
-    return res.status(400).json({ message: 'الحالة المطلوبة مش صحيحة.' });
+    return res.status(400).json({ message: "الحالة المطلوبة مش صحيحة." });
   }
 
   const db = readDB();
   const user = (db.users || []).find((u) => u.id === req.params.id);
-  if (!user) return res.status(404).json({ message: 'مش لاقي المستخدم ده.' });
+  if (!user) return res.status(404).json({ message: "مش لاقي المستخدم ده." });
 
   const previousStatus = user.status;
   user.status = status;
 
-  if (user.role === 'pro') {
+  if (user.role === "pro") {
     const worker = (db.workers || []).find((w) => w.userId === user.id);
     if (worker) {
-      worker.isAvailable = status === 'active';
+      worker.isAvailable = status === "active";
     }
   }
 
   writeDB(db);
 
-  logAdminAction(req, 'user_status_changed', 'user', user.id, {
+  logAdminAction(req, "user_status_changed", "user", user.id, {
     targetName: user.fullName,
     from: previousStatus,
     to: status,
@@ -657,19 +879,22 @@ app.patch('/admin/users/:id/status', verifyAdmin, (req, res) => {
   res.json(sanitizeUser(user));
 });
 
-app.post('/admin/bootstrap', async (req, res) => {
-  if (!BOOTSTRAP_SECRET || req.headers['x-bootstrap-secret'] !== BOOTSTRAP_SECRET) {
-    return res.status(404).json({ message: 'Not Found' });
+app.post("/admin/bootstrap", async (req, res) => {
+  if (
+    !BOOTSTRAP_SECRET ||
+    req.headers["x-bootstrap-secret"] !== BOOTSTRAP_SECRET
+  ) {
+    return res.status(404).json({ message: "Not Found" });
   }
 
   const { email, password, fullName } = req.body;
   if (!email || !password || !fullName) {
-    return res.status(400).json({ message: 'بيانات ناقصة.' });
+    return res.status(400).json({ message: "بيانات ناقصة." });
   }
 
   const db = readDB();
-  if (db.users.find((u) => u.role === 'admin')) {
-    return res.status(409).json({ message: 'فيه أدمن متعمل بالفعل.' });
+  if (db.users.find((u) => u.role === "admin")) {
+    return res.status(409).json({ message: "فيه أدمن متعمل بالفعل." });
   }
 
   const hashedPassword = await bcrypt.hash(password, 10);
@@ -678,64 +903,68 @@ app.post('/admin/bootstrap', async (req, res) => {
     email,
     password: hashedPassword,
     fullName,
-    role: 'admin',
-    status: 'active',
+    role: "admin",
+    status: "active",
     createdAt: new Date().toISOString(),
   };
   db.users.push(admin);
   writeDB(db);
-  res.status(201).json({ message: 'اتعمل الأدمن بنجاح.' });
+  res.status(201).json({ message: "اتعمل الأدمن بنجاح." });
 });
 
-app.patch('/admin/me', verifyAdmin, async (req, res) => {
+app.patch("/admin/me", verifyAdmin, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ message: 'إيميل غير صالح.' });
+      return res.status(400).json({ message: "إيميل غير صالح." });
     }
 
     const db = readDB();
 
-    const emailTaken = db.users.find((u) => u.email === email && u.id !== req.userId);
+    const emailTaken = db.users.find(
+      (u) => u.email === email && u.id !== req.userId,
+    );
     if (emailTaken) {
-      return res.status(409).json({ message: 'الإيميل ده مستخدم بالفعل بحساب تاني.' });
+      return res
+        .status(409)
+        .json({ message: "الإيميل ده مستخدم بالفعل بحساب تاني." });
     }
 
     const admin = db.users.find((u) => u.id === req.userId);
-    if (!admin) return res.status(404).json({ message: 'الحساب مش موجود.' });
+    if (!admin) return res.status(404).json({ message: "الحساب مش موجود." });
 
     const previousEmail = admin.email;
     admin.email = email;
     writeDB(db);
 
-    logAdminAction(req, 'admin_email_changed', 'admin', admin.id, {
+    logAdminAction(req, "admin_email_changed", "admin", admin.id, {
       from: previousEmail,
       to: email,
     });
 
     res.json(sanitizeUser(admin));
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
 // ============ COUPONS ============
 
 function generateCouponCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
   for (let i = 0; i < 8; i++) {
     code += chars[Math.floor(Math.random() * chars.length)];
   }
   return code;
 }
 
-app.get('/admin/coupons', verifyAdmin, (req, res) => {
+app.get("/admin/coupons", verifyAdmin, (req, res) => {
   const db = readDB();
   res.json(db.coupons || []);
 });
 
-app.post('/admin/coupons', verifyAdmin, (req, res) => {
+app.post("/admin/coupons", verifyAdmin, (req, res) => {
   try {
     const {
       code,
@@ -746,24 +975,32 @@ app.post('/admin/coupons', verifyAdmin, (req, res) => {
       expiryDate,
     } = req.body;
 
-    if (!discountType || !['percentage', 'fixed'].includes(discountType)) {
-      return res.status(400).json({ message: 'نوع الخصم لازم يكون percentage أو fixed.' });
+    if (!discountType || !["percentage", "fixed"].includes(discountType)) {
+      return res
+        .status(400)
+        .json({ message: "نوع الخصم لازم يكون percentage أو fixed." });
     }
     if (!discountValue || Number(discountValue) <= 0) {
-      return res.status(400).json({ message: 'قيمة الخصم لازم تكون رقم أكبر من صفر.' });
+      return res
+        .status(400)
+        .json({ message: "قيمة الخصم لازم تكون رقم أكبر من صفر." });
     }
-    if (discountType === 'percentage' && Number(discountValue) > 100) {
-      return res.status(400).json({ message: 'نسبة الخصم مينفعش تتعدى 100%.' });
+    if (discountType === "percentage" && Number(discountValue) > 100) {
+      return res.status(400).json({ message: "نسبة الخصم مينفعش تتعدى 100%." });
     }
 
     const db = readDB();
     if (!db.coupons) db.coupons = [];
 
-    const finalCode = (code ? String(code).trim().toUpperCase() : generateCouponCode());
+    const finalCode = code
+      ? String(code).trim().toUpperCase()
+      : generateCouponCode();
 
     const codeExists = db.coupons.find((c) => c.code === finalCode);
     if (codeExists) {
-      return res.status(409).json({ message: 'الكود ده مستخدم بالفعل، جرب كود تاني.' });
+      return res
+        .status(409)
+        .json({ message: "الكود ده مستخدم بالفعل، جرب كود تاني." });
     }
 
     const newCoupon = {
@@ -783,7 +1020,7 @@ app.post('/admin/coupons', verifyAdmin, (req, res) => {
     db.coupons.push(newCoupon);
     writeDB(db);
 
-    logAdminAction(req, 'coupon_created', 'coupon', newCoupon.id, {
+    logAdminAction(req, "coupon_created", "coupon", newCoupon.id, {
       code: newCoupon.code,
       discountType: newCoupon.discountType,
       discountValue: newCoupon.discountValue,
@@ -791,22 +1028,22 @@ app.post('/admin/coupons', verifyAdmin, (req, res) => {
 
     res.status(201).json(newCoupon);
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
-app.patch('/admin/coupons/:id', verifyAdmin, (req, res) => {
+app.patch("/admin/coupons/:id", verifyAdmin, (req, res) => {
   const db = readDB();
   const coupon = (db.coupons || []).find((c) => c.id === req.params.id);
-  if (!coupon) return res.status(404).json({ message: 'مش لاقي الكوبون ده.' });
+  if (!coupon) return res.status(404).json({ message: "مش لاقي الكوبون ده." });
 
   const allowedFields = [
-    'discountType',
-    'discountValue',
-    'tradeRestriction',
-    'maxTotalUses',
-    'expiryDate',
-    'isActive',
+    "discountType",
+    "discountValue",
+    "tradeRestriction",
+    "maxTotalUses",
+    "expiryDate",
+    "isActive",
   ];
   for (const field of allowedFields) {
     if (field in req.body) {
@@ -816,7 +1053,7 @@ app.patch('/admin/coupons/:id', verifyAdmin, (req, res) => {
 
   writeDB(db);
 
-  logAdminAction(req, 'coupon_updated', 'coupon', coupon.id, {
+  logAdminAction(req, "coupon_updated", "coupon", coupon.id, {
     code: coupon.code,
     changes: req.body,
   });
@@ -824,39 +1061,52 @@ app.patch('/admin/coupons/:id', verifyAdmin, (req, res) => {
   res.json(coupon);
 });
 
-app.delete('/admin/coupons/:id', verifyAdmin, (req, res) => {
+app.delete("/admin/coupons/:id", verifyAdmin, (req, res) => {
   const db = readDB();
   const coupon = (db.coupons || []).find((c) => c.id === req.params.id);
   db.coupons = (db.coupons || []).filter((c) => c.id !== req.params.id);
   writeDB(db);
 
   if (coupon) {
-    logAdminAction(req, 'coupon_deleted', 'coupon', req.params.id, { code: coupon.code });
+    logAdminAction(req, "coupon_deleted", "coupon", req.params.id, {
+      code: coupon.code,
+    });
   }
 
   res.json({ success: true });
 });
 
-app.post('/coupons/validate', verifyToken, (req, res) => {
+app.post("/coupons/validate", verifyToken, (req, res) => {
   try {
     const { code, trade } = req.body;
     if (!code) {
-      return res.status(400).json({ valid: false, message: 'اكتب كود الكوبون الأول.' });
+      return res
+        .status(400)
+        .json({ valid: false, message: "اكتب كود الكوبون الأول." });
     }
 
     const db = readDB();
     const coupon = (db.coupons || []).find(
-      (c) => c.code === String(code).trim().toUpperCase()
+      (c) => c.code === String(code).trim().toUpperCase(),
     );
 
     if (!coupon) {
-      return res.status(404).json({ valid: false, message: 'الكود ده مش موجود.' });
+      return res
+        .status(404)
+        .json({ valid: false, message: "الكود ده مش موجود." });
     }
     if (!coupon.isActive) {
-      return res.status(400).json({ valid: false, message: 'الكوبون ده مش شغال دلوقتي.' });
+      return res
+        .status(400)
+        .json({ valid: false, message: "الكوبون ده مش شغال دلوقتي." });
     }
-    if (coupon.expiryDate && Date.now() > new Date(coupon.expiryDate).getTime()) {
-      return res.status(400).json({ valid: false, message: 'الكوبون ده منتهي الصلاحية.' });
+    if (
+      coupon.expiryDate &&
+      Date.now() > new Date(coupon.expiryDate).getTime()
+    ) {
+      return res
+        .status(400)
+        .json({ valid: false, message: "الكوبون ده منتهي الصلاحية." });
     }
     if (coupon.tradeRestriction && trade && coupon.tradeRestriction !== trade) {
       return res.status(400).json({
@@ -864,11 +1114,18 @@ app.post('/coupons/validate', verifyToken, (req, res) => {
         message: `الكوبون ده مخصص لخدمة تانية بس.`,
       });
     }
-    if (coupon.maxTotalUses != null && coupon.usedCount >= coupon.maxTotalUses) {
-      return res.status(400).json({ valid: false, message: 'الكوبون ده خلص الاستخدامات بتاعته.' });
+    if (
+      coupon.maxTotalUses != null &&
+      coupon.usedCount >= coupon.maxTotalUses
+    ) {
+      return res
+        .status(400)
+        .json({ valid: false, message: "الكوبون ده خلص الاستخدامات بتاعته." });
     }
     if (coupon.usedByUserIds.includes(req.userId)) {
-      return res.status(400).json({ valid: false, message: 'أنت استخدمت الكوبون ده قبل كده.' });
+      return res
+        .status(400)
+        .json({ valid: false, message: "أنت استخدمت الكوبون ده قبل كده." });
     }
 
     res.json({
@@ -878,11 +1135,11 @@ app.post('/coupons/validate', verifyToken, (req, res) => {
       code: coupon.code,
     });
   } catch (err) {
-    res.status(500).json({ valid: false, message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ valid: false, message: "حصل خطأ في السيرفر." });
   }
 });
 
-app.get('/coupons/active', (req, res) => {
+app.get("/coupons/active", (req, res) => {
   const db = readDB();
   const now = Date.now();
 
@@ -915,41 +1172,55 @@ function computePublicStats() {
   const bookings = db.bookings || [];
   const reviews = db.reviews || [];
 
-  const activeUserIds = new Set(users.filter((u) => u.status === 'active').map((u) => u.id));
+  const activeUserIds = new Set(
+    users.filter((u) => u.status === "active").map((u) => u.id),
+  );
 
   const approvedWorkers = workers.filter((w) => activeUserIds.has(w.userId));
   const totalWorkers = approvedWorkers.length;
   const activeWorkersNow = approvedWorkers.filter((w) => w.isAvailable).length;
 
-  const totalClients = users.filter((u) => u.role === 'client' && u.status === 'active').length;
+  const totalClients = users.filter(
+    (u) => u.role === "client" && u.status === "active",
+  ).length;
 
-  const completedBookings = bookings.filter((b) => b.status === 'completed');
+  const completedBookings = bookings.filter((b) => b.status === "completed");
   const completedJobs = completedBookings.length;
 
   const avgRating =
     reviews.length > 0
       ? Math.round(
-          (reviews.reduce((sum, r) => sum + (Number(r.rating) || 0), 0) / reviews.length) * 10
+          (reviews.reduce((sum, r) => sum + (Number(r.rating) || 0), 0) /
+            reviews.length) *
+            10,
         ) / 10
       : 0;
 
   const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
   const now = Date.now();
   const recentCompletedRevenue = completedBookings
-    .filter((b) => b.scheduledAt && now - new Date(b.scheduledAt).getTime() <= THIRTY_DAYS_MS)
+    .filter(
+      (b) =>
+        b.scheduledAt &&
+        now - new Date(b.scheduledAt).getTime() <= THIRTY_DAYS_MS,
+    )
     .reduce((sum, b) => sum + (Number(b.totalAmount) || 0), 0);
-  const avgMonthlyIncome = totalWorkers > 0 ? Math.round(recentCompletedRevenue / totalWorkers) : 0;
+  const avgMonthlyIncome =
+    totalWorkers > 0 ? Math.round(recentCompletedRevenue / totalWorkers) : 0;
 
   const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
   const clientsThisWeek = new Set(
     bookings
-      .filter((b) => b.createdAt && now - new Date(b.createdAt).getTime() <= SEVEN_DAYS_MS)
-      .map((b) => b.clientId)
+      .filter(
+        (b) =>
+          b.createdAt && now - new Date(b.createdAt).getTime() <= SEVEN_DAYS_MS,
+      )
+      .map((b) => b.clientId),
   ).size;
 
   const workersByTrade = {};
   approvedWorkers.forEach((w) => {
-    const trade = w.trade || 'other';
+    const trade = w.trade || "other";
     workersByTrade[trade] = (workersByTrade[trade] || 0) + 1;
   });
 
@@ -966,7 +1237,7 @@ function computePublicStats() {
   };
 }
 
-app.get('/stats/public', (req, res) => {
+app.get("/stats/public", (req, res) => {
   try {
     const now = Date.now();
     if (!publicStatsCache || now - publicStatsCacheAt > PUBLIC_STATS_TTL_MS) {
@@ -975,12 +1246,12 @@ app.get('/stats/public', (req, res) => {
     }
     res.json(publicStatsCache);
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
 // ── إنشاء حجز (مخصص، بيسبق أي هاندلر تاني على /bookings) ─────────────
-app.post('/bookings', verifyToken, (req, res) => {
+app.post("/bookings", verifyToken, (req, res) => {
   try {
     const { couponCode, ...bookingData } = req.body;
     const db = readDB();
@@ -991,34 +1262,46 @@ app.post('/bookings', verifyToken, (req, res) => {
 
     if (couponCode) {
       const coupon = (db.coupons || []).find(
-        (c) => c.code === String(couponCode).trim().toUpperCase()
+        (c) => c.code === String(couponCode).trim().toUpperCase(),
       );
 
       if (!coupon) {
-        return res.status(400).json({ message: 'كود الكوبون ده مش موجود.' });
+        return res.status(400).json({ message: "كود الكوبون ده مش موجود." });
       }
       if (!coupon.isActive) {
-        return res.status(400).json({ message: 'الكوبون ده مش شغال دلوقتي.' });
+        return res.status(400).json({ message: "الكوبون ده مش شغال دلوقتي." });
       }
-      if (coupon.expiryDate && Date.now() > new Date(coupon.expiryDate).getTime()) {
-        return res.status(400).json({ message: 'الكوبون ده منتهي الصلاحية.' });
+      if (
+        coupon.expiryDate &&
+        Date.now() > new Date(coupon.expiryDate).getTime()
+      ) {
+        return res.status(400).json({ message: "الكوبون ده منتهي الصلاحية." });
       }
       if (
         coupon.tradeRestriction &&
         bookingData.trade &&
         coupon.tradeRestriction !== bookingData.trade
       ) {
-        return res.status(400).json({ message: 'الكوبون ده مخصص لخدمة تانية بس.' });
+        return res
+          .status(400)
+          .json({ message: "الكوبون ده مخصص لخدمة تانية بس." });
       }
-      if (coupon.maxTotalUses != null && coupon.usedCount >= coupon.maxTotalUses) {
-        return res.status(400).json({ message: 'الكوبون ده خلص الاستخدامات بتاعته.' });
+      if (
+        coupon.maxTotalUses != null &&
+        coupon.usedCount >= coupon.maxTotalUses
+      ) {
+        return res
+          .status(400)
+          .json({ message: "الكوبون ده خلص الاستخدامات بتاعته." });
       }
       if (coupon.usedByUserIds.includes(req.userId)) {
-        return res.status(400).json({ message: 'أنت استخدمت الكوبون ده قبل كده.' });
+        return res
+          .status(400)
+          .json({ message: "أنت استخدمت الكوبون ده قبل كده." });
       }
 
       discountAmount =
-        coupon.discountType === 'percentage'
+        coupon.discountType === "percentage"
           ? (originalAmount * coupon.discountValue) / 100
           : coupon.discountValue;
       discountAmount = Math.min(discountAmount, originalAmount);
@@ -1028,7 +1311,8 @@ app.post('/bookings', verifyToken, (req, res) => {
       coupon.usedByUserIds.push(req.userId);
     }
 
-    const finalAmount = Math.round((originalAmount - discountAmount) * 100) / 100;
+    const finalAmount =
+      Math.round((originalAmount - discountAmount) * 100) / 100;
 
     if (!db.bookings) db.bookings = [];
     const newBooking = {
@@ -1047,25 +1331,29 @@ app.post('/bookings', verifyToken, (req, res) => {
     writeDB(db);
 
     sendAdminNotificationEmail(
-      'حجز جديد - صنايعي',
+      "حجز جديد - صنايعي",
       `
       <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
         <h2 style="color: #2563EB;">حجز جديد</h2>
         <p><strong>${newBooking.clientName}</strong> حجز <strong>${newBooking.workerName}</strong>
           (${newBooking.workerTrade}).</p>
         <p>القيمة: ${newBooking.totalAmount} ج.م${
-        newBooking.couponCode ? ` (بعد خصم كوبون "${newBooking.couponCode}")` : ''
-      }</p>
+          newBooking.couponCode
+            ? ` (بعد خصم كوبون "${newBooking.couponCode}")`
+            : ""
+        }</p>
         <a href="${ALLOWED_ORIGIN}/admin/bookings" style="display:inline-block; background:#2563EB; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
           شوف الحجوزات
         </a>
       </div>
-      `
+      `,
     );
 
     //  إيميل حقيقي للصنايعي نفسه (مش بس إشعار داخل الموقع) — بيوصله
     // حتى لو مش فاتح صنايعي دلوقتي. بنجيب إيميله عن طريق worker.userId
-    const bookedWorker = (db.workers || []).find((w) => w.id === newBooking.workerId);
+    const bookedWorker = (db.workers || []).find(
+      (w) => w.id === newBooking.workerId,
+    );
     const bookedWorkerUser = bookedWorker
       ? (db.users || []).find((u) => u.id === bookedWorker.userId)
       : null;
@@ -1073,32 +1361,33 @@ app.post('/bookings', verifyToken, (req, res) => {
     sendUserEmail(
       bookedWorkerUser?.email,
       bookedWorkerUser?.fullName,
-      'طلب شغل جديد - صنايعي',
+      "طلب شغل جديد - صنايعي",
       `
       <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
         <h2 style="color: #2563EB;">طلب شغل جديد</h2>
-        <p>أهلاً ${bookedWorkerUser?.fullName ?? ''}،</p>
+        <p>أهلاً ${bookedWorkerUser?.fullName ?? ""}،</p>
         <p><strong>${newBooking.clientName}</strong> طلب خدمتك (${newBooking.workerTrade}).</p>
         <p>القيمة: ${newBooking.totalAmount} ج.م</p>
         <a href="${ALLOWED_ORIGIN}/pro/requests" style="display:inline-block; background:#2563EB; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
           شوف الطلب وقرر
         </a>
       </div>
-      `
+      `,
     );
 
     res.status(201).json(newBooking);
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
 // ── رقم تلفون العميل/الصنايعي بتاعين حجز معين ────────────────
-app.get('/bookings/:id/contact', verifyToken, (req, res) => {
+app.get("/bookings/:id/contact", verifyToken, (req, res) => {
   try {
     const db = readDB();
     const booking = (db.bookings || []).find((b) => b.id === req.params.id);
-    if (!booking) return res.status(404).json({ message: 'الحجز ده مش موجود.' });
+    if (!booking)
+      return res.status(404).json({ message: "الحجز ده مش موجود." });
 
     const worker = (db.workers || []).find((w) => w.id === booking.workerId);
     const workerUserId = worker?.userId ?? null;
@@ -1106,42 +1395,59 @@ app.get('/bookings/:id/contact', verifyToken, (req, res) => {
     const isClient = req.userId === booking.clientId;
     const isWorker = workerUserId && req.userId === workerUserId;
     if (!isClient && !isWorker) {
-      return res.status(403).json({ message: 'مش مسموحلك تشوف بيانات التواصل دي.' });
+      return res
+        .status(403)
+        .json({ message: "مش مسموحلك تشوف بيانات التواصل دي." });
     }
 
     const clientUser = (db.users || []).find((u) => u.id === booking.clientId);
-    const workerUser = workerUserId ? (db.users || []).find((u) => u.id === workerUserId) : null;
+    const workerUser = workerUserId
+      ? (db.users || []).find((u) => u.id === workerUserId)
+      : null;
 
     res.json({
       clientPhone: clientUser?.mobileNumber ?? null,
       workerPhone: workerUser?.mobileNumber ?? null,
     });
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
-// ── تحديث مرحلة الشغل (في الطريق / بدأ الشغل / خلّص) ─────────
-const VALID_WORK_STAGES = ['on_the_way', 'in_progress', 'done'];
+// باللاندنج بيدج (testimonials.component.ts) اللي بيظهر لزوار مش مسجلين
+// دخول. بيرجع اسم التخصص بس، مفيش أي بيانات حساسة (مفيش عنوان، تليفون،
+// اسم عميل، مبلغ، أو أي حاجة تانية من الحجز)
+app.get("/bookings/:id/trade-label", (req, res) => {
+  const db = readDB();
+  const booking = (db.bookings || []).find((b) => b.id === req.params.id);
+  if (!booking) return res.status(404).json({ message: "Not Found" });
+  res.json({ workerTrade: booking.workerTrade ?? null });
+});
 
-app.patch('/bookings/:id/work-stage', verifyToken, (req, res) => {
+// ── تحديث مرحلة الشغل (في الطريق / بدأ الشغل / خلّص) ─────────
+const VALID_WORK_STAGES = ["on_the_way", "in_progress", "done"];
+
+app.patch("/bookings/:id/work-stage", verifyToken, (req, res) => {
   try {
     const { workStage } = req.body;
     if (!VALID_WORK_STAGES.includes(workStage)) {
-      return res.status(400).json({ message: 'مرحلة الشغل المطلوبة مش صحيحة.' });
+      return res
+        .status(400)
+        .json({ message: "مرحلة الشغل المطلوبة مش صحيحة." });
     }
 
     const db = readDB();
     const booking = (db.bookings || []).find((b) => b.id === req.params.id);
-    if (!booking) return res.status(404).json({ message: 'الحجز ده مش موجود.' });
+    if (!booking)
+      return res.status(404).json({ message: "الحجز ده مش موجود." });
 
     const worker = (db.workers || []).find((w) => w.id === booking.workerId);
     if (!worker || worker.userId !== req.userId) {
-      return res.status(403).json({ message: 'مش مسموحلك تعدّل الحجز ده.' });
+      return res.status(403).json({ message: "مش مسموحلك تعدّل الحجز ده." });
     }
 
-    if (booking.status !== 'active') {
-      return res.status(400).json({ message: 'الطلب ده مش شغل جاري دلوقتي.' });
+    if (booking.status !== "active") {
+      return res.status(400).json({ message: "الطلب ده مش شغل جاري دلوقتي." });
     }
 
     booking.workStage = workStage;
@@ -1149,28 +1455,31 @@ app.patch('/bookings/:id/work-stage', verifyToken, (req, res) => {
 
     res.json(booking);
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
 // ── رد الصنايعي على تقييم ─────────────────────────────────
-app.patch('/reviews/:id/reply', verifyToken, (req, res) => {
+app.patch("/reviews/:id/reply", verifyToken, (req, res) => {
   try {
     const { reply } = req.body;
     if (!reply || !String(reply).trim()) {
-      return res.status(400).json({ message: 'اكتب رد الأول.' });
+      return res.status(400).json({ message: "اكتب رد الأول." });
     }
     if (String(reply).trim().length > 500) {
-      return res.status(400).json({ message: 'الرد طويل أوي، حاول تختصره.' });
+      return res.status(400).json({ message: "الرد طويل أوي، حاول تختصره." });
     }
 
     const db = readDB();
     const review = (db.reviews || []).find((r) => r.id === req.params.id);
-    if (!review) return res.status(404).json({ message: 'التقييم ده مش موجود.' });
+    if (!review)
+      return res.status(404).json({ message: "التقييم ده مش موجود." });
 
     const worker = (db.workers || []).find((w) => w.id === review.workerId);
     if (!worker || worker.userId !== req.userId) {
-      return res.status(403).json({ message: 'مش مسموحلك ترد على التقييم ده.' });
+      return res
+        .status(403)
+        .json({ message: "مش مسموحلك ترد على التقييم ده." });
     }
 
     review.workerReply = String(reply).trim();
@@ -1179,7 +1488,7 @@ app.patch('/reviews/:id/reply', verifyToken, (req, res) => {
 
     res.json(review);
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
@@ -1189,27 +1498,28 @@ app.patch('/reviews/:id/reply', verifyToken, (req, res) => {
 // والبحث الجغرافي كلهم مبنيين على البيانات دي وقت الموافقة). التعديل
 // عليهم بقى مقصور على الأدمن بس، من endpoint إدارة المستخدمين.
 const WORKER_OWNER_EDITABLE_FIELDS = [
-  'fullName',
-  'hourlyRate',
-  'yearsOfExperience',
-  'serviceRadius',
-  'bio',
-  'avatarColor',
-  'skills',
-  'isAvailable',
+  "fullName",
+  "hourlyRate",
+  "yearsOfExperience",
+  "serviceRadius",
+  "bio",
+  "avatarColor",
+  "skills",
+  "isAvailable",
 ];
 
-const WORKER_ADMIN_ONLY_FIELDS = ['trade', 'tradeLabel', 'city'];
+const WORKER_ADMIN_ONLY_FIELDS = ["trade", "tradeLabel", "city"];
 
 function updateWorkerProfile(req, res) {
   const db = readDB();
   const worker = (db.workers || []).find((w) => w.id === req.params.id);
-  if (!worker) return res.status(404).json({ message: 'مش لاقي بيانات الصنايعي.' });
+  if (!worker)
+    return res.status(404).json({ message: "مش لاقي بيانات الصنايعي." });
 
   const isOwner = worker.userId === req.userId;
-  const isAdmin = req.userRole === 'admin';
+  const isAdmin = req.userRole === "admin";
   if (!isOwner && !isAdmin) {
-    return res.status(403).json({ message: 'مش مسموحلك تعدّل البروفايل ده.' });
+    return res.status(403).json({ message: "مش مسموحلك تعدّل البروفايل ده." });
   }
 
   const allowedFields = isAdmin
@@ -1226,10 +1536,10 @@ function updateWorkerProfile(req, res) {
   res.json(worker);
 }
 
-app.put('/workers/:id', verifyToken, updateWorkerProfile);
-app.patch('/workers/:id', verifyToken, updateWorkerProfile);
+app.put("/workers/:id", verifyToken, updateWorkerProfile);
+app.patch("/workers/:id", verifyToken, updateWorkerProfile);
 
-app.post('/workers', verifyToken, (req, res) => {
+app.post("/workers", verifyToken, (req, res) => {
   const db = readDB();
   if (!db.workers) db.workers = [];
   const newItem = { id: crypto.randomUUID(), ...req.body, userId: req.userId };
@@ -1238,12 +1548,12 @@ app.post('/workers', verifyToken, (req, res) => {
   res.status(201).json(newItem);
 });
 
-app.delete('/workers/:id', verifyToken, (req, res) => {
+app.delete("/workers/:id", verifyToken, (req, res) => {
   const db = readDB();
   const item = (db.workers || []).find((w) => w.id === req.params.id);
   if (!item) return res.json({ success: true });
-  if (item.userId !== req.userId && req.userRole !== 'admin') {
-    return res.status(403).json({ message: 'مش مسموحلك تحذف البروفايل ده.' });
+  if (item.userId !== req.userId && req.userRole !== "admin") {
+    return res.status(403).json({ message: "مش مسموحلك تحذف البروفايل ده." });
   }
   db.workers = (db.workers || []).filter((w) => w.id !== req.params.id);
   writeDB(db);
@@ -1251,7 +1561,7 @@ app.delete('/workers/:id', verifyToken, (req, res) => {
 });
 
 // ============ WORKERS — قراءة عامة (Public) ============
-const SPECIAL_QUERY_KEYS = ['_sort', '_order', '_limit', '_page'];
+const SPECIAL_QUERY_KEYS = ["_sort", "_order", "_limit", "_page"];
 
 function applyQueryFilters(items, query) {
   let result = items;
@@ -1261,7 +1571,7 @@ function applyQueryFilters(items, query) {
   });
 
   if (query._sort) {
-    const order = query._order === 'desc' ? -1 : 1;
+    const order = query._order === "desc" ? -1 : 1;
     result = [...result].sort((a, b) => {
       const field = query._sort;
       if (a[field] < b[field]) return -1 * order;
@@ -1277,24 +1587,24 @@ function applyQueryFilters(items, query) {
   return result;
 }
 
-app.get('/workers', (req, res) => {
+app.get("/workers", (req, res) => {
   const db = readDB();
   let items = (db.workers || []).filter((worker) => {
     const owner = (db.users || []).find((u) => u.id === worker.userId);
-    return !owner || owner.status === 'active';
+    return !owner || owner.status === "active";
   });
   items = applyQueryFilters(items, req.query);
   res.json(items);
 });
 
-app.get('/workers/:id', (req, res) => {
+app.get("/workers/:id", (req, res) => {
   const db = readDB();
   const item = (db.workers || []).find((w) => w.id === req.params.id);
-  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!item) return res.status(404).json({ message: "Not Found" });
 
   const owner = (db.users || []).find((u) => u.id === item.userId);
-  if (owner && owner.status !== 'active') {
-    return res.status(404).json({ message: 'Not Found' });
+  if (owner && owner.status !== "active") {
+    return res.status(404).json({ message: "Not Found" });
   }
 
   res.json(item);
@@ -1304,9 +1614,12 @@ app.get('/workers/:id', (req, res) => {
 function recomputeWorkerRating(db, workerId) {
   const reviews = (db.reviews || []).filter((r) => r.workerId === workerId);
   const reviewsCount = reviews.length;
-  const rating = reviewsCount > 0
-    ? Math.round((reviews.reduce((sum, r) => sum + r.rating, 0) / reviewsCount) * 10) / 10
-    : 0;
+  const rating =
+    reviewsCount > 0
+      ? Math.round(
+          (reviews.reduce((sum, r) => sum + r.rating, 0) / reviewsCount) * 10,
+        ) / 10
+      : 0;
   const worker = (db.workers || []).find((w) => w.id === workerId);
   if (worker) {
     worker.rating = rating;
@@ -1314,48 +1627,57 @@ function recomputeWorkerRating(db, workerId) {
   }
 }
 
-app.get('/reviews', (req, res) => {
+app.get("/reviews", (req, res) => {
   const db = readDB();
   const items = applyQueryFilters(db.reviews || [], req.query);
   res.json(items);
 });
 
-app.get('/reviews/:id', (req, res) => {
+app.get("/reviews/:id", (req, res) => {
   const db = readDB();
   const item = (db.reviews || []).find((r) => r.id === req.params.id);
-  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!item) return res.status(404).json({ message: "Not Found" });
   res.json(item);
 });
 
-app.post('/reviews', verifyToken, (req, res) => {
+app.post("/reviews", verifyToken, (req, res) => {
   try {
     const { bookingId, clientName, workerId, rating, comment } = req.body;
 
     if (!bookingId || !workerId || rating == null) {
-      return res.status(400).json({ message: 'بيانات التقييم ناقصة.' });
+      return res.status(400).json({ message: "بيانات التقييم ناقصة." });
     }
     const numRating = Number(rating);
     if (!Number.isFinite(numRating) || numRating < 1 || numRating > 5) {
-      return res.status(400).json({ message: 'التقييم لازم يكون رقم من 1 لـ 5.' });
+      return res
+        .status(400)
+        .json({ message: "التقييم لازم يكون رقم من 1 لـ 5." });
     }
 
     const db = readDB();
     const booking = (db.bookings || []).find((b) => b.id === bookingId);
-    if (!booking) return res.status(404).json({ message: 'الحجز ده مش موجود.' });
+    if (!booking)
+      return res.status(404).json({ message: "الحجز ده مش موجود." });
 
     if (booking.clientId !== req.userId) {
-      return res.status(403).json({ message: 'مش مسموحلك تقيّم الحجز ده.' });
+      return res.status(403).json({ message: "مش مسموحلك تقيّم الحجز ده." });
     }
-    if (booking.status !== 'completed') {
-      return res.status(400).json({ message: 'تقدر تقيّم بس بعد ما الشغل يخلص.' });
+    if (booking.status !== "completed") {
+      return res
+        .status(400)
+        .json({ message: "تقدر تقيّم بس بعد ما الشغل يخلص." });
     }
     if (booking.workerId !== workerId) {
-      return res.status(400).json({ message: 'بيانات التقييم مش متطابقة مع الحجز.' });
+      return res
+        .status(400)
+        .json({ message: "بيانات التقييم مش متطابقة مع الحجز." });
     }
 
-    const alreadyReviewed = (db.reviews || []).find((r) => r.bookingId === bookingId);
+    const alreadyReviewed = (db.reviews || []).find(
+      (r) => r.bookingId === bookingId,
+    );
     if (alreadyReviewed) {
-      return res.status(409).json({ message: 'قيّمت الحجز ده قبل كده.' });
+      return res.status(409).json({ message: "قيّمت الحجز ده قبل كده." });
     }
 
     if (!db.reviews) db.reviews = [];
@@ -1363,10 +1685,10 @@ app.post('/reviews', verifyToken, (req, res) => {
       id: crypto.randomUUID(),
       bookingId,
       clientId: req.userId,
-      clientName: clientName ?? '',
+      clientName: clientName ?? "",
       workerId,
       rating: numRating,
-      comment: comment ?? '',
+      comment: comment ?? "",
       createdAt: new Date().toISOString(),
     };
     db.reviews.push(newReview);
@@ -1375,28 +1697,31 @@ app.post('/reviews', verifyToken, (req, res) => {
 
     res.status(201).json(newReview);
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
-app.patch('/reviews/:id', verifyToken, (req, res) => {
+app.patch("/reviews/:id", verifyToken, (req, res) => {
   try {
     const db = readDB();
     const review = (db.reviews || []).find((r) => r.id === req.params.id);
-    if (!review) return res.status(404).json({ message: 'التقييم ده مش موجود.' });
+    if (!review)
+      return res.status(404).json({ message: "التقييم ده مش موجود." });
 
-    if (review.clientId !== req.userId && req.userRole !== 'admin') {
-      return res.status(403).json({ message: 'مش مسموحلك تعدّل التقييم ده.' });
+    if (review.clientId !== req.userId && req.userRole !== "admin") {
+      return res.status(403).json({ message: "مش مسموحلك تعدّل التقييم ده." });
     }
 
-    if ('rating' in req.body) {
+    if ("rating" in req.body) {
       const numRating = Number(req.body.rating);
       if (!Number.isFinite(numRating) || numRating < 1 || numRating > 5) {
-        return res.status(400).json({ message: 'التقييم لازم يكون رقم من 1 لـ 5.' });
+        return res
+          .status(400)
+          .json({ message: "التقييم لازم يكون رقم من 1 لـ 5." });
       }
       review.rating = numRating;
     }
-    if ('comment' in req.body) {
+    if ("comment" in req.body) {
       review.comment = req.body.comment;
     }
     review.updatedAt = new Date().toISOString();
@@ -1405,14 +1730,14 @@ app.patch('/reviews/:id', verifyToken, (req, res) => {
     writeDB(db);
     res.json(review);
   } catch (err) {
-    res.status(500).json({ message: 'حصل خطأ في السيرفر.' });
+    res.status(500).json({ message: "حصل خطأ في السيرفر." });
   }
 });
 
-app.delete('/reviews/:id', verifyAdmin, (req, res) => {
+app.delete("/reviews/:id", verifyAdmin, (req, res) => {
   const db = readDB();
   const review = (db.reviews || []).find((r) => r.id === req.params.id);
-  if (!review) return res.status(404).json({ message: 'مش لاقي التقييم ده.' });
+  if (!review) return res.status(404).json({ message: "مش لاقي التقييم ده." });
 
   db.reviews = (db.reviews || []).filter((r) => r.id !== req.params.id);
   recomputeWorkerRating(db, review.workerId);
@@ -1422,27 +1747,27 @@ app.delete('/reviews/:id', verifyAdmin, (req, res) => {
 
 // ============ BOOKINGS — الباقي (GET/PATCH/PUT/DELETE) ============
 function canAccessBooking(req, booking, db) {
-  if (req.userRole === 'admin') return true;
+  if (req.userRole === "admin") return true;
   if (booking.clientId === req.userId) return true;
   const worker = (db.workers || []).find((w) => w.id === booking.workerId);
   return !!(worker && worker.userId === req.userId);
 }
 
-app.get('/bookings', verifyToken, (req, res) => {
+app.get("/bookings", verifyToken, (req, res) => {
   const db = readDB();
   let items = applyQueryFilters(db.bookings || [], req.query);
-  if (req.userRole !== 'admin') {
+  if (req.userRole !== "admin") {
     items = items.filter((b) => canAccessBooking(req, b, db));
   }
   res.json(items);
 });
 
-app.get('/bookings/:id', verifyToken, (req, res) => {
+app.get("/bookings/:id", verifyToken, (req, res) => {
   const db = readDB();
   const item = (db.bookings || []).find((b) => b.id === req.params.id);
-  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!item) return res.status(404).json({ message: "Not Found" });
   if (!canAccessBooking(req, item, db)) {
-    return res.status(403).json({ message: 'مش مسموحلك تشوف الحجز ده.' });
+    return res.status(403).json({ message: "مش مسموحلك تشوف الحجز ده." });
   }
   res.json(item);
 });
@@ -1450,9 +1775,9 @@ app.get('/bookings/:id', verifyToken, (req, res) => {
 function updateBookingHandler(req, res) {
   const db = readDB();
   const index = (db.bookings || []).findIndex((b) => b.id === req.params.id);
-  if (index === -1) return res.status(404).json({ message: 'Not Found' });
+  if (index === -1) return res.status(404).json({ message: "Not Found" });
   if (!canAccessBooking(req, db.bookings[index], db)) {
-    return res.status(403).json({ message: 'مش مسموحلك تعدّل الحجز ده.' });
+    return res.status(403).json({ message: "مش مسموحلك تعدّل الحجز ده." });
   }
   const previousStatus = db.bookings[index].status;
   const { clientId, workerId, ...safeChanges } = req.body;
@@ -1463,31 +1788,37 @@ function updateBookingHandler(req, res) {
   // فعلاً اتغيّرت (مش نفس الحالة القديمة)، عشان مانبعتش إيميلات مكررة على
   // أي تعديل تاني (زي تعديل العنوان أو الميعاد)
   const newStatus = safeChanges.status;
-  if (newStatus && newStatus !== previousStatus && ['active', 'completed', 'cancelled'].includes(newStatus)) {
+  if (
+    newStatus &&
+    newStatus !== previousStatus &&
+    ["active", "completed", "cancelled"].includes(newStatus)
+  ) {
     const updatedBooking = db.bookings[index];
-    const client = (db.users || []).find((u) => u.id === updatedBooking.clientId);
+    const client = (db.users || []).find(
+      (u) => u.id === updatedBooking.clientId,
+    );
 
     const emailByStatus = {
       active: {
-        subject: 'الصنايعي قبل طلبك - صنايعي',
-        color: '#16A34A',
-        title: 'الصنايعي قبل طلبك',
+        subject: "الصنايعي قبل طلبك - صنايعي",
+        color: "#16A34A",
+        title: "الصنايعي قبل طلبك",
         body: `<strong>${updatedBooking.workerName}</strong> قبل طلبك (${updatedBooking.workerTrade}) وهيبدأ الشغل عليه.`,
-        cta: 'شوف تفاصيل الطلب',
+        cta: "شوف تفاصيل الطلب",
       },
       completed: {
-        subject: 'شغلك خلص - صنايعي',
-        color: '#2563EB',
-        title: 'الشغل خلص بنجاح',
+        subject: "شغلك خلص - صنايعي",
+        color: "#2563EB",
+        title: "الشغل خلص بنجاح",
         body: `<strong>${updatedBooking.workerName}</strong> خلّص شغله معاك (${updatedBooking.workerTrade}). لو حابب، قيّم تجربتك عشان تفيد عملاء تانيين.`,
-        cta: 'قيّم الصنايعي',
+        cta: "قيّم الصنايعي",
       },
       cancelled: {
-        subject: 'طلبك اتلغى - صنايعي',
-        color: '#DC2626',
-        title: 'الطلب اتلغى',
+        subject: "طلبك اتلغى - صنايعي",
+        color: "#DC2626",
+        title: "الطلب اتلغى",
         body: `للأسف طلبك مع <strong>${updatedBooking.workerName}</strong> (${updatedBooking.workerTrade}) اتلغى. تقدر تدور على صنايعي تاني في نفس التخصص.`,
-        cta: 'دور على صنايعي تاني',
+        cta: "دور على صنايعي تاني",
       },
     };
     const emailContent = emailByStatus[newStatus];
@@ -1499,27 +1830,27 @@ function updateBookingHandler(req, res) {
       `
       <div dir="rtl" style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px;">
         <h2 style="color: ${emailContent.color};">${emailContent.title}</h2>
-        <p>أهلاً ${client?.fullName ?? ''}،</p>
+        <p>أهلاً ${client?.fullName ?? ""}،</p>
         <p>${emailContent.body}</p>
         <a href="${ALLOWED_ORIGIN}/orders/${updatedBooking.id}" style="display:inline-block; background:${emailContent.color}; color:#fff; padding:10px 20px; border-radius:8px; text-decoration:none; margin-top:12px;">
           ${emailContent.cta}
         </a>
       </div>
-      `
+      `,
     );
   }
 
   res.json(db.bookings[index]);
 }
-app.put('/bookings/:id', verifyToken, updateBookingHandler);
-app.patch('/bookings/:id', verifyToken, updateBookingHandler);
+app.put("/bookings/:id", verifyToken, updateBookingHandler);
+app.patch("/bookings/:id", verifyToken, updateBookingHandler);
 
-app.delete('/bookings/:id', verifyToken, (req, res) => {
+app.delete("/bookings/:id", verifyToken, (req, res) => {
   const db = readDB();
   const item = (db.bookings || []).find((b) => b.id === req.params.id);
   if (!item) return res.json({ success: true });
   if (!canAccessBooking(req, item, db)) {
-    return res.status(403).json({ message: 'مش مسموحلك تحذف الحجز ده.' });
+    return res.status(403).json({ message: "مش مسموحلك تحذف الحجز ده." });
   }
   db.bookings = (db.bookings || []).filter((b) => b.id !== req.params.id);
   writeDB(db);
@@ -1528,30 +1859,32 @@ app.delete('/bookings/:id', verifyToken, (req, res) => {
 
 // ============ CONVERSATIONS ============
 function canAccessConversation(req, conversation) {
-  return conversation.clientId === req.userId || conversation.workerId === req.userId;
+  return (
+    conversation.clientId === req.userId || conversation.workerId === req.userId
+  );
 }
 
-app.get('/conversations', verifyToken, (req, res) => {
+app.get("/conversations", verifyToken, (req, res) => {
   const db = readDB();
   let items = applyQueryFilters(db.conversations || [], req.query);
   items = items.filter((c) => canAccessConversation(req, c));
   res.json(items);
 });
 
-app.get('/conversations/:id', verifyToken, (req, res) => {
+app.get("/conversations/:id", verifyToken, (req, res) => {
   const db = readDB();
   const item = (db.conversations || []).find((c) => c.id === req.params.id);
-  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!item) return res.status(404).json({ message: "Not Found" });
   if (!canAccessConversation(req, item)) {
-    return res.status(403).json({ message: 'مش مسموحلك تشوف المحادثة دي.' });
+    return res.status(403).json({ message: "مش مسموحلك تشوف المحادثة دي." });
   }
   res.json(item);
 });
 
-app.post('/conversations', verifyToken, (req, res) => {
+app.post("/conversations", verifyToken, (req, res) => {
   const { clientId, workerId } = req.body;
   if (req.userId !== clientId && req.userId !== workerId) {
-    return res.status(403).json({ message: 'مش مسموحلك تعمل المحادثة دي.' });
+    return res.status(403).json({ message: "مش مسموحلك تعمل المحادثة دي." });
   }
   const db = readDB();
   if (!db.conversations) db.conversations = [];
@@ -1563,26 +1896,30 @@ app.post('/conversations', verifyToken, (req, res) => {
 
 function updateConversationHandler(req, res) {
   const db = readDB();
-  const index = (db.conversations || []).findIndex((c) => c.id === req.params.id);
-  if (index === -1) return res.status(404).json({ message: 'Not Found' });
+  const index = (db.conversations || []).findIndex(
+    (c) => c.id === req.params.id,
+  );
+  if (index === -1) return res.status(404).json({ message: "Not Found" });
   if (!canAccessConversation(req, db.conversations[index])) {
-    return res.status(403).json({ message: 'مش مسموحلك تعدّل المحادثة دي.' });
+    return res.status(403).json({ message: "مش مسموحلك تعدّل المحادثة دي." });
   }
   db.conversations[index] = { ...db.conversations[index], ...req.body };
   writeDB(db);
   res.json(db.conversations[index]);
 }
-app.put('/conversations/:id', verifyToken, updateConversationHandler);
-app.patch('/conversations/:id', verifyToken, updateConversationHandler);
+app.put("/conversations/:id", verifyToken, updateConversationHandler);
+app.patch("/conversations/:id", verifyToken, updateConversationHandler);
 
-app.delete('/conversations/:id', verifyToken, (req, res) => {
+app.delete("/conversations/:id", verifyToken, (req, res) => {
   const db = readDB();
   const item = (db.conversations || []).find((c) => c.id === req.params.id);
   if (!item) return res.json({ success: true });
   if (!canAccessConversation(req, item)) {
-    return res.status(403).json({ message: 'مش مسموحلك تحذف المحادثة دي.' });
+    return res.status(403).json({ message: "مش مسموحلك تحذف المحادثة دي." });
   }
-  db.conversations = (db.conversations || []).filter((c) => c.id !== req.params.id);
+  db.conversations = (db.conversations || []).filter(
+    (c) => c.id !== req.params.id,
+  );
   writeDB(db);
   res.json({ success: true });
 });
@@ -1592,32 +1929,38 @@ function canAccessMessage(req, message) {
   return message.senderId === req.userId || message.recipientId === req.userId;
 }
 
-app.get('/messages', verifyToken, (req, res) => {
+app.get("/messages", verifyToken, (req, res) => {
   const db = readDB();
   let items = applyQueryFilters(db.messages || [], req.query);
   items = items.filter((m) => canAccessMessage(req, m));
   res.json(items);
 });
 
-app.get('/messages/:id', verifyToken, (req, res) => {
+app.get("/messages/:id", verifyToken, (req, res) => {
   const db = readDB();
   const item = (db.messages || []).find((m) => m.id === req.params.id);
-  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!item) return res.status(404).json({ message: "Not Found" });
   if (!canAccessMessage(req, item)) {
-    return res.status(403).json({ message: 'مش مسموحلك تشوف الرسالة دي.' });
+    return res.status(403).json({ message: "مش مسموحلك تشوف الرسالة دي." });
   }
   res.json(item);
 });
 
-app.post('/messages', verifyToken, (req, res) => {
+app.post("/messages", verifyToken, (req, res) => {
   const { conversationId, senderId, recipientId } = req.body;
   if (req.userId !== senderId) {
-    return res.status(403).json({ message: 'مش مسموحلك تبعت رسالة نيابة عن حد تاني.' });
+    return res
+      .status(403)
+      .json({ message: "مش مسموحلك تبعت رسالة نيابة عن حد تاني." });
   }
   const db = readDB();
-  const conversation = (db.conversations || []).find((c) => c.id === conversationId);
+  const conversation = (db.conversations || []).find(
+    (c) => c.id === conversationId,
+  );
   if (!conversation || !canAccessConversation(req, conversation)) {
-    return res.status(403).json({ message: 'المحادثة دي مش موجودة أو مش بتاعتك.' });
+    return res
+      .status(403)
+      .json({ message: "المحادثة دي مش موجودة أو مش بتاعتك." });
   }
   if (!db.messages) db.messages = [];
   const newItem = { id: crypto.randomUUID(), ...req.body };
@@ -1629,24 +1972,24 @@ app.post('/messages', verifyToken, (req, res) => {
 function updateMessageHandler(req, res) {
   const db = readDB();
   const index = (db.messages || []).findIndex((m) => m.id === req.params.id);
-  if (index === -1) return res.status(404).json({ message: 'Not Found' });
+  if (index === -1) return res.status(404).json({ message: "Not Found" });
   const message = db.messages[index];
   if (message.recipientId !== req.userId) {
-    return res.status(403).json({ message: 'مش مسموحلك تعدّل الرسالة دي.' });
+    return res.status(403).json({ message: "مش مسموحلك تعدّل الرسالة دي." });
   }
   db.messages[index] = { ...message, ...req.body };
   writeDB(db);
   res.json(db.messages[index]);
 }
-app.put('/messages/:id', verifyToken, updateMessageHandler);
-app.patch('/messages/:id', verifyToken, updateMessageHandler);
+app.put("/messages/:id", verifyToken, updateMessageHandler);
+app.patch("/messages/:id", verifyToken, updateMessageHandler);
 
-app.delete('/messages/:id', verifyToken, (req, res) => {
+app.delete("/messages/:id", verifyToken, (req, res) => {
   const db = readDB();
   const item = (db.messages || []).find((m) => m.id === req.params.id);
   if (!item) return res.json({ success: true });
   if (!canAccessMessage(req, item)) {
-    return res.status(403).json({ message: 'مش مسموحلك تحذف الرسالة دي.' });
+    return res.status(403).json({ message: "مش مسموحلك تحذف الرسالة دي." });
   }
   db.messages = (db.messages || []).filter((m) => m.id !== req.params.id);
   writeDB(db);
@@ -1655,29 +1998,29 @@ app.delete('/messages/:id', verifyToken, (req, res) => {
 
 // ============ NOTIFICATIONS ============
 function canAccessNotification(req, notification) {
-  return req.userRole === 'admin' || notification.userId === req.userId;
+  return req.userRole === "admin" || notification.userId === req.userId;
 }
 
-app.get('/notifications', verifyToken, (req, res) => {
+app.get("/notifications", verifyToken, (req, res) => {
   const db = readDB();
   let items = applyQueryFilters(db.notifications || [], req.query);
-  if (req.userRole !== 'admin') {
+  if (req.userRole !== "admin") {
     items = items.filter((n) => n.userId === req.userId);
   }
   res.json(items);
 });
 
-app.get('/notifications/:id', verifyToken, (req, res) => {
+app.get("/notifications/:id", verifyToken, (req, res) => {
   const db = readDB();
   const item = (db.notifications || []).find((n) => n.id === req.params.id);
-  if (!item) return res.status(404).json({ message: 'Not Found' });
+  if (!item) return res.status(404).json({ message: "Not Found" });
   if (!canAccessNotification(req, item)) {
-    return res.status(403).json({ message: 'مش مسموحلك تشوف الإشعار ده.' });
+    return res.status(403).json({ message: "مش مسموحلك تشوف الإشعار ده." });
   }
   res.json(item);
 });
 
-app.post('/notifications', verifyToken, (req, res) => {
+app.post("/notifications", verifyToken, (req, res) => {
   const db = readDB();
   if (!db.notifications) db.notifications = [];
   const newItem = {
@@ -1693,31 +2036,35 @@ app.post('/notifications', verifyToken, (req, res) => {
 
 function updateNotificationHandler(req, res) {
   const db = readDB();
-  const index = (db.notifications || []).findIndex((n) => n.id === req.params.id);
-  if (index === -1) return res.status(404).json({ message: 'Not Found' });
+  const index = (db.notifications || []).findIndex(
+    (n) => n.id === req.params.id,
+  );
+  if (index === -1) return res.status(404).json({ message: "Not Found" });
   if (!canAccessNotification(req, db.notifications[index])) {
-    return res.status(403).json({ message: 'مش مسموحلك تعدّل الإشعار ده.' });
+    return res.status(403).json({ message: "مش مسموحلك تعدّل الإشعار ده." });
   }
   db.notifications[index] = { ...db.notifications[index], ...req.body };
   writeDB(db);
   res.json(db.notifications[index]);
 }
-app.put('/notifications/:id', verifyToken, updateNotificationHandler);
-app.patch('/notifications/:id', verifyToken, updateNotificationHandler);
+app.put("/notifications/:id", verifyToken, updateNotificationHandler);
+app.patch("/notifications/:id", verifyToken, updateNotificationHandler);
 
-app.delete('/notifications/:id', verifyToken, (req, res) => {
+app.delete("/notifications/:id", verifyToken, (req, res) => {
   const db = readDB();
   const item = (db.notifications || []).find((n) => n.id === req.params.id);
   if (!item) return res.json({ success: true });
   if (!canAccessNotification(req, item)) {
-    return res.status(403).json({ message: 'مش مسموحلك تحذف الإشعار ده.' });
+    return res.status(403).json({ message: "مش مسموحلك تحذف الإشعار ده." });
   }
-  db.notifications = (db.notifications || []).filter((n) => n.id !== req.params.id);
+  db.notifications = (db.notifications || []).filter(
+    (n) => n.id !== req.params.id,
+  );
   writeDB(db);
   res.json({ success: true });
 });
 
-app.get('/', (req, res) => res.send('Sanaye3i Backend is Running '));
+app.get("/", (req, res) => res.send("Sanaye3i Backend is Running "));
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => console.log(`Server running on port ${port}`));
